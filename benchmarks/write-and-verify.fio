@@ -1,0 +1,15 @@
+[global]
+rw=randwrite
+direct=1
+ioengine=libaio
+bs=4k
+size=100m
+verify=crc32c
+nrfiles=5
+iodepth=16
+
+[j0]
+[j1]
+[j2]
+[j3]
+[j4]

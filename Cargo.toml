@@ -1,0 +1,24 @@
+[package]
+name = "fuse-zstd"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = []
+with_disk_inode_cache = [
+	"sled"
+]
+
+[dependencies]
+clap = "2"
+env_logger = "0.8"
+fuser = "0.9"
+libc = "0.2.108"
+log = "0.4"
+lru = "0.7"
+sled = { version = "0.34", optional = true}
+tempfile = "3"
+xattr = "0.2"
+zstd = "0.9"
