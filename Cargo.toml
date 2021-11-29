@@ -22,3 +22,8 @@ sled = { version = "0.34", optional = true}
 tempfile = "3"
 xattr = "0.2"
 zstd = "0.9"
+
+[dev-dependencies]
+rstest = "0.11"
+assert_cmd = "2.0"
+proc-mounts = "0.2"
