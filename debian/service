@@ -1,0 +1,16 @@
+[Unit]
+Description=fuse-zstd Service
+After=dev-fuse.mount
+
+[Service]
+Type=exec
+User=fuse-zstd
+Group=fuse-zstd
+EnvironmentFile=-/etc/conf.d/fuse-zstd.env
+WorkingDirectory=/mnt/
+RuntimeDirectory=fuse-zstd
+RuntimeDirectoryMode=0775
+ExecStart=fuse-zstd ${FUSE_ZSTD_DEBUG_FLAGS}
+
+[Install]
+WantedBy=multi-user.target

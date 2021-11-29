@@ -34,3 +34,16 @@ zstd = "0.9"
 rstest = "0.11"
 assert_cmd = "2.0"
 proc-mounts = "0.2"
+
+[package.metadata.deb]
+maintainer-scripts = "debian/"
+systemd-units = { enable = false }
+depends = "$auto"
+section = "otherosfs"
+priority = "optional"
+assets = [
+    ["debian/fuse-zstd.env", "etc/conf.d/", "644"],
+    ["target/release/fuse-zstd", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/fuse-zstd/README", "644"],
+]
+conf-files = ["etc/conf.d/fuse-zstd.env"]
