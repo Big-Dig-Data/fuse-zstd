@@ -2,8 +2,15 @@
 name = "fuse-zstd"
 version = "0.1.0"
 edition = "2021"
+authors = ["Stepan Henek <stepan@bigdigdata.com>"]
+license = "MIT"
+readme = "README.md"
+keywords = ["fuse", "zstd"]
+repository = "https://gitlab.com/big-dig-data/fuse-zstd/"
+categories = ["filesystem"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[badges]
+maintenance = { status = "actively-developed" }
 
 [features]
 default = []
