@@ -9,7 +9,7 @@ use lru::LruCache;
 #[cfg(feature = "with_disk_inode_cache")]
 use sled::{Db, Error as SledError};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     ffi::OsStr,
     fs::{self, File},
     io::{self, Seek, SeekFrom},
@@ -387,7 +387,7 @@ impl ZstdFS {
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
-        _size: Option<u64>,
+        size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
@@ -397,8 +397,14 @@ impl ZstdFS {
         _bkuptime: Option<std::time::SystemTime>,
         _flags: Option<u32>,
     ) -> Result<FileAttr, libc::c_int> {
-        // TODO set attr doesn't actually change anything here,
-        // but this call was required otherwise no files would be created
+        // TODO allow setting other arguments
+
+        // Truncate if required
+        if let Some(size) = size {
+            if let Some(file) = self.opened_files.get(&ino).as_ref() {
+                file.set_len(size).map_err(convert_io_error)?;
+            }
+        }
         self.getattr_wrapper(ino)
     }
 
@@ -479,7 +485,6 @@ impl ZstdFS {
         // Create emtpy file in the tree dir
         let name = name.to_string_lossy().to_string() + ".zst";
         let parent_path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
-        let path = parent_path.join(&name);
 
         let opened_file = tempfile::tempfile().map_err(convert_io_error)?;
         let fh = opened_file.as_raw_fd();
@@ -875,7 +880,7 @@ impl Filesystem for ZstdFS {
         reply: fuser::ReplyWrite,
     ) {
         debug!(
-            "Write (ino={}, fh={:?}, offset={}, data_len={}, write_flags={:x}, flags={:x}), lock={:?}",
+            "Write (ino={}, fh={}, offset={}, data_len={}, write_flags={:x}, flags={:x}), lock={:?}",
             ino, fh, offset, data.len(), write_flags, flags, lock_owner
         );
         match self.write_wrapper(ino, fh, offset, data, write_flags, flags, lock_owner) {

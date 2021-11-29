@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use rstest::*;
-use std::fs;
+use std::{fs, path};
 use zstd::decode_all;
 
 #[path = "utils.rs"]
@@ -9,6 +9,13 @@ mod utils;
 #[fixture]
 fn mounted_fs() -> utils::FuseZstdProcess {
     utils::FuseZstdProcess::new()
+}
+
+fn sync_file<P>(path: P)
+where
+    P: AsRef<path::Path>,
+{
+    fs::File::open(path).unwrap().sync_all().unwrap();
 }
 
 #[fixture]
@@ -117,6 +124,8 @@ fn cat(populated_mounted_fs: utils::FuseZstdProcess) {
 #[rstest]
 fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
     let mp = populated_mounted_fs.mount_point();
+    let dd = populated_mounted_fs.data_dir();
+
     // new file
     Command::new("tee")
         .arg(&mp.join("first/second/file-new.txt"))
@@ -125,18 +134,49 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
         .success()
         .stdout("new file content");
 
-    let dd = populated_mounted_fs.data_dir();
     // Make sure that all the changes are written
     // Target directory needs to be synced due to inode update
-    fs::File::open(dd.join("first/second/"))
-        .unwrap()
-        .sync_all()
-        .unwrap();
+    sync_file(dd.join("first/second/"));
 
     let zfile = dd.join("first/second/file-new.txt.zst");
     assert_eq!(
         String::from_utf8(decode_all(fs::File::open(zfile).unwrap()).unwrap()).unwrap(),
         "new file content"
+    );
+
+    // truncate
+    Command::new("tee")
+        .arg(&mp.join("first/file1.txt"))
+        .write_stdin("truncated")
+        .assert()
+        .success()
+        .stdout("truncated");
+    // Make sure that all the changes are written
+    // Target directory needs to be synced due to inode update
+    sync_file(dd.join("first/"));
+
+    let zfile = dd.join("first/file1.txt.zst");
+    assert_eq!(
+        String::from_utf8(decode_all(fs::File::open(zfile).unwrap()).unwrap()).unwrap(),
+        "truncated"
+    );
+
+    // append
+    Command::new("tee")
+        .arg("-a")
+        .arg(&mp.join("first/file1.txt"))
+        .write_stdin(" and appended")
+        .assert()
+        .success()
+        .stdout(" and appended");
+    // Make sure that all the changes are written
+    // Target directory needs to be synced due to inode update
+    sync_file(dd.join("first/"));
+
+    let zfile = dd.join("first/file1.txt.zst");
+    assert_eq!(
+        String::from_utf8(decode_all(fs::File::open(zfile).unwrap()).unwrap()).unwrap(),
+        "truncated and appended"
     );
 }
 
