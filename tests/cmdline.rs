@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use rstest::*;
-use std::{fs, path, thread, time};
+use std::fs;
 use zstd::decode_all;
 
 #[path = "utils.rs"]
@@ -138,4 +138,135 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
         String::from_utf8(decode_all(fs::File::open(zfile).unwrap()).unwrap()).unwrap(),
         "new file content"
     );
+}
+
+#[rstest]
+fn mv(populated_mounted_fs: utils::FuseZstdProcess) {
+    let mp = populated_mounted_fs.mount_point();
+    let dd = populated_mounted_fs.data_dir();
+
+    // move file within directory
+    Command::new("mv")
+        .arg(&mp.join("first/second/file1.txt"))
+        .arg(&mp.join("first/second/fileI.txt"))
+        .assert()
+        .success();
+    assert!(dd.join("first/second/fileI.txt.zst").exists());
+    assert!(!dd.join("first/second/file1.txt.zst").exists());
+
+    // move file to existing directory
+    Command::new("mv")
+        .arg(&mp.join("first/second/file2.txt"))
+        .arg(&mp.join("first/file3.txt"))
+        .assert()
+        .success();
+    assert!(!dd.join("first/second/file2.txt.zst").exists());
+    assert!(dd.join("first/file3.txt.zst").exists());
+    assert_eq!(
+        String::from_utf8(
+            decode_all(fs::File::open(dd.join("first/file3.txt.zst")).unwrap()).unwrap()
+        )
+        .unwrap(),
+        "2nd file in second"
+    );
+
+    // move file to existing file
+    Command::new("mv")
+        .arg(&mp.join("first/file1.txt"))
+        .arg(&mp.join("first/second/third/file1.txt"))
+        .assert()
+        .success();
+    assert!(!dd.join("first/file1.txt.zst").exists());
+    assert!(dd.join("first/second/third/file1.txt.zst").exists());
+    assert_eq!(
+        String::from_utf8(
+            decode_all(fs::File::open(dd.join("first/second/third/file1.txt.zst")).unwrap())
+                .unwrap()
+        )
+        .unwrap(),
+        "1st file in first"
+    );
+
+    // move directory within directory
+    Command::new("mv")
+        .arg(&mp.join("first/second/empty"))
+        .arg(&mp.join("first/second/void"))
+        .assert()
+        .success();
+    assert!(!dd.join("first/second/empty").exists());
+    assert!(dd.join("first/second/void").exists());
+
+    // move directory to existing directory
+    Command::new("mv")
+        .arg(&mp.join("first/second"))
+        .arg(&mp)
+        .assert()
+        .success();
+    assert!(!dd.join("first/second").exists());
+    assert!(dd.join("second/void").exists());
+
+    // move directory to existing file
+    Command::new("mv")
+        .arg(&mp.join("second/third"))
+        .arg(&mp.join("second/file3.txt"))
+        .assert()
+        .failure();
+    assert!(dd.join("second/third").exists());
+}
+
+#[rstest]
+fn rm(populated_mounted_fs: utils::FuseZstdProcess) {
+    let mp = populated_mounted_fs.mount_point();
+    let dd = populated_mounted_fs.data_dir();
+    // existing
+    Command::new("rm")
+        .arg(&mp.join("first/file1.txt"))
+        .assert()
+        .success();
+    assert!(!dd.join("first/file1.txt.zst").exists());
+
+    // non-existing
+    Command::new("rm")
+        .arg(&mp.join("non-existing.txt"))
+        .assert()
+        .failure();
+    assert!(!dd.join("non-existing.txt.zst").exists());
+
+    // directory
+    Command::new("rm").arg(&mp.join("first")).assert().failure();
+    assert!(dd.join("first").exists());
+}
+
+#[rstest]
+fn rmdir(populated_mounted_fs: utils::FuseZstdProcess) {
+    let mp = populated_mounted_fs.mount_point();
+    let dd = populated_mounted_fs.data_dir();
+
+    // existing empty
+    Command::new("rmdir")
+        .arg(&mp.join("first/second/empty"))
+        .assert()
+        .success();
+    assert!(!dd.join("first/second/empty").exists());
+
+    // existing non-empty
+    Command::new("rmdir")
+        .arg(&mp.join("first/second/third"))
+        .assert()
+        .failure();
+    assert!(dd.join("first/second/third").exists());
+
+    // existing file
+    Command::new("rmdir")
+        .arg(&mp.join("first/file1.txt"))
+        .assert()
+        .failure();
+    assert!(dd.join("first/file1.txt.zst").exists());
+
+    // non-existing
+    Command::new("rmdir")
+        .arg(&mp.join("first/non-existing.txt"))
+        .assert()
+        .failure();
+    assert!(!dd.join("first/non-existing.txt.zst").exists());
 }
