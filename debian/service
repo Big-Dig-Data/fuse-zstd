@@ -10,7 +10,7 @@ EnvironmentFile=-/etc/conf.d/fuse-zstd.env
 WorkingDirectory=/mnt/
 RuntimeDirectory=fuse-zstd
 RuntimeDirectoryMode=0775
-ExecStart=fuse-zstd ${FUSE_ZSTD_DEBUG_FLAGS}
+ExecStart=sh -c "fuse-zstd ${FUSE_ZSTD_DEBUG_FLAGS} ${FUSE_ZSTD_CONVERT_FLAG}"
 
 [Install]
 WantedBy=multi-user.target

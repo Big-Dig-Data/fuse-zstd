@@ -41,6 +41,17 @@ impl From<FileAttrWrapper> for FileAttr {
     }
 }
 
+impl FileAttrWrapper {
+    fn update_realsize(&mut self, file: &File) -> Result<(), libc::c_int> {
+        self.file_attr.size = file
+            .get_xattr("user.real_size")
+            .map_err(convert_io_error)?
+            .map(|e| u64::from_be_bytes(e.to_vec().try_into().unwrap()))
+            .unwrap_or(0);
+        Ok(())
+    }
+}
+
 fn convert_io_error<E>(err: E) -> libc::c_int
 where
     E: Into<io::Error>,
@@ -173,10 +184,13 @@ struct ZstdFS {
     inode_db: Option<LruCache<u64, String>>,
     #[cfg(feature = "with_disk_inode_cache")]
     inode_dir: tempfile::TempDir,
+    /// Convert uncompressed data from original directory
+    /// to compressed files
+    convert: bool,
 }
 
 impl ZstdFS {
-    fn new(tree_dir: String, compression_level: u8) -> io::Result<ZstdFS> {
+    fn new(tree_dir: String, compression_level: u8, convert: bool) -> io::Result<ZstdFS> {
         Ok(Self {
             compression_level,
             tree_dir: tree_dir.into(),
@@ -184,6 +198,7 @@ impl ZstdFS {
             inode_db: None,
             #[cfg(feature = "with_disk_inode_cache")]
             inode_dir: tempfile::tempdir()?,
+            convert,
         })
     }
 
@@ -282,34 +297,72 @@ impl ZstdFS {
     }
 
     fn lookup_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, libc::c_int> {
-        let path = self.get_inode_path(parent)?;
+        let path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
         let entries = fs::read_dir(&path).map_err(convert_io_error)?;
+        let name = name.to_string_lossy().to_string();
         for entry in entries {
             let entry = entry.map_err(convert_io_error)?;
 
             // add prefix .zstd for regular files
             let filename = if entry.file_type().map_err(convert_io_error)?.is_file() {
-                name.to_string_lossy().to_string() + ".zst"
+                format!("{}.zst", &name)
             } else {
-                name.to_string_lossy().to_string()
+                name.clone()
             };
             if entry.file_name().to_string_lossy() == filename {
                 self.set_inode_path(entry.ino(), &path, &filename)?;
                 let mut faw = FileAttrWrapper::try_from(entry).map_err(convert_io_error)?;
                 // Update size from extended attributes
-                let file =
-                    fs::File::open(format!("{}/{}", path, filename)).map_err(convert_io_error)?;
-                faw.file_attr.size = file
-                    .get_xattr("user.real_size")
-                    .map_err(convert_io_error)?
-                    .map(|e| u64::from_be_bytes(e.to_vec().try_into().unwrap()))
-                    .unwrap_or(0);
+                let file = fs::File::open(path.join(filename)).map_err(convert_io_error)?;
+                faw.update_realsize(&file)?;
 
                 let mut attrs: FileAttr = faw.into();
                 // allow access to all
                 access_all(&mut attrs);
 
+                // cleanup uncompressed files in convert move
+                if self.convert && attrs.kind == FileType::RegularFile {
+                    let _ = fs::remove_file(path.join(&name));
+                }
+
                 return Ok(attrs);
+            }
+        }
+
+        if self.convert && !name.ends_with(".zst") {
+            // Uncompressed file may exist lets try to find it and compress it
+            //
+            // note that in convert mode every only files without .zst extension
+            // can be converted
+            let entries = fs::read_dir(&path).map_err(convert_io_error)?;
+            for entry in entries {
+                let entry = entry.map_err(convert_io_error)?;
+                if entry.file_name().to_string_lossy() == name
+                    && entry.file_type().map_err(convert_io_error)?.is_file()
+                {
+                    let zname = format!("{}.zst", &name);
+                    let source_file = fs::File::open(path.join(&name)).map_err(convert_io_error)?;
+                    let file =
+                        store_to_source_file(&source_file, &path, &zname, self.compression_level)?;
+                    file.sync_all().map_err(convert_io_error)?;
+
+                    // File was copied now we can remove the original
+                    let _ = fs::remove_file(path.join(&name));
+
+                    let mut faw = FileAttrWrapper::try_from(
+                        source_file.metadata().map_err(convert_io_error)?,
+                    )
+                    .map_err(convert_io_error)?;
+                    faw.update_realsize(&file)?;
+
+                    let mut attrs: FileAttr = faw.into();
+                    // allow access to all
+                    access_all(&mut attrs);
+
+                    self.set_inode_path(attrs.ino, path, zname)?;
+
+                    return Ok(attrs);
+                }
             }
         }
         Err(libc::ENOENT)
@@ -318,7 +371,7 @@ impl ZstdFS {
     fn readdir_wrapper(
         &mut self,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         reply: &mut ReplyDirectory,
     ) -> Result<(), libc::c_int> {
@@ -338,15 +391,26 @@ impl ZstdFS {
 
             let file_name = entry.file_name().to_string_lossy().to_string();
 
-            if file_type == FileType::RegularFile && !file_name.ends_with(".zst") {
-                continue;
-            }
-
-            let file_name = if file_type == FileType::RegularFile {
-                file_name.strip_suffix(".zst").unwrap().to_string()
-            } else {
-                file_name
+            let file_name = match file_type {
+                FileType::RegularFile => {
+                    if !file_name.ends_with(".zst") {
+                        if !self.convert {
+                            // Hide non-zstd file in non converting mode
+                            continue;
+                        } else {
+                            file_name
+                        }
+                    } else {
+                        file_name.strip_suffix(".zst").unwrap().to_string()
+                    }
+                }
+                FileType::Directory => file_name,
+                _ => {
+                    // skip other types
+                    continue;
+                }
             };
+
             debug!(
                 "Entry {}, {}, {:?}, {:?}",
                 entry.ino(),
@@ -365,15 +429,10 @@ impl ZstdFS {
         let file_path = self.get_inode_path(ino)?;
         let file = fs::File::open(file_path).map_err(convert_io_error)?;
         let metadata = file.metadata().map_err(convert_io_error)?;
-        let faw: FileAttrWrapper = metadata.try_into().map_err(convert_io_error)?;
-        let mut attrs: FileAttr = faw.into();
-
+        let mut faw: FileAttrWrapper = metadata.try_into().map_err(convert_io_error)?;
         // Update size from ext attr
-        attrs.size = file
-            .get_xattr("user.real_size")
-            .map_err(convert_io_error)?
-            .map(|e| u64::from_be_bytes(e.to_vec().try_into().unwrap()))
-            .unwrap_or(0);
+        faw.update_realsize(&file)?;
+        let mut attrs: FileAttr = faw.into();
 
         // Allow access to all
         access_all(&mut attrs);
@@ -458,6 +517,8 @@ impl ZstdFS {
                     .to_be_bytes(),
             )
             .map_err(convert_io_error)?;
+        // Make sure that new size is written to original directory
+        source_file.sync_all().map_err(convert_io_error)?;
 
         self.opened_files.insert(ino, target_file);
 
@@ -1012,9 +1073,15 @@ fn main() -> io::Result<()> {
                 .multiple(true)
                 .help("Sets the level of verbosity"),
         )
+        .arg(
+            Arg::with_name("convert")
+                .long("convert")
+                .help("Will convert files uncompressed files from data dir"),
+        )
         .get_matches();
 
     let verbosity: u64 = matches.occurrences_of("v");
+    let convert: bool = matches.is_present("convert");
     let log_level = match verbosity {
         0 => LevelFilter::Error,
         1 => LevelFilter::Warn,
@@ -1049,11 +1116,11 @@ fn main() -> io::Result<()> {
     ];
     options.push(MountOption::AutoUnmount);
     info!(
-        "Starting fuse-zstd with compression level={}",
-        compression_level
+        "Starting fuse-zstd with compression level={}, convert={}",
+        compression_level, convert,
     );
     fuser::mount2(
-        ZstdFS::new(data_dir, compression_level)?,
+        ZstdFS::new(data_dir, compression_level, convert)?,
         mountpoint,
         &options,
     )

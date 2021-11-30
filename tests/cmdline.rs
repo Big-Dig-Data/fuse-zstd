@@ -8,14 +8,7 @@ mod utils;
 
 #[fixture]
 fn mounted_fs() -> utils::FuseZstdProcess {
-    utils::FuseZstdProcess::new()
-}
-
-fn sync_file<P>(path: P)
-where
-    P: AsRef<path::Path>,
-{
-    fs::File::open(path).unwrap().sync_all().unwrap();
+    utils::FuseZstdProcess::new(false)
 }
 
 #[fixture]
@@ -136,13 +129,10 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
 
     // Make sure that all the changes are written
     // Target directory needs to be synced due to inode update
-    sync_file(dd.join("first/second/"));
+    utils::sync_file(dd.join("first/second/"));
 
     let zfile = dd.join("first/second/file-new.txt.zst");
-    assert_eq!(
-        String::from_utf8(decode_all(fs::File::open(zfile).unwrap()).unwrap()).unwrap(),
-        "new file content"
-    );
+    assert_eq!(utils::get_compressed_content(zfile), "new file content");
 
     // truncate
     Command::new("tee")
@@ -153,13 +143,10 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
         .stdout("truncated");
     // Make sure that all the changes are written
     // Target directory needs to be synced due to inode update
-    sync_file(dd.join("first/"));
+    utils::sync_file(dd.join("first/"));
 
     let zfile = dd.join("first/file1.txt.zst");
-    assert_eq!(
-        String::from_utf8(decode_all(fs::File::open(zfile).unwrap()).unwrap()).unwrap(),
-        "truncated"
-    );
+    assert_eq!(utils::get_compressed_content(zfile), "truncated");
 
     // append
     Command::new("tee")
@@ -171,11 +158,11 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
         .stdout(" and appended");
     // Make sure that all the changes are written
     // Target directory needs to be synced due to inode update
-    sync_file(dd.join("first/"));
+    utils::sync_file(dd.join("first/"));
 
     let zfile = dd.join("first/file1.txt.zst");
     assert_eq!(
-        String::from_utf8(decode_all(fs::File::open(zfile).unwrap()).unwrap()).unwrap(),
+        utils::get_compressed_content(zfile),
         "truncated and appended"
     );
 }
@@ -203,10 +190,7 @@ fn mv(populated_mounted_fs: utils::FuseZstdProcess) {
     assert!(!dd.join("first/second/file2.txt.zst").exists());
     assert!(dd.join("first/file3.txt.zst").exists());
     assert_eq!(
-        String::from_utf8(
-            decode_all(fs::File::open(dd.join("first/file3.txt.zst")).unwrap()).unwrap()
-        )
-        .unwrap(),
+        utils::get_compressed_content(dd.join("first/file3.txt.zst")),
         "2nd file in second"
     );
 
@@ -219,11 +203,7 @@ fn mv(populated_mounted_fs: utils::FuseZstdProcess) {
     assert!(!dd.join("first/file1.txt.zst").exists());
     assert!(dd.join("first/second/third/file1.txt.zst").exists());
     assert_eq!(
-        String::from_utf8(
-            decode_all(fs::File::open(dd.join("first/second/third/file1.txt.zst")).unwrap())
-                .unwrap()
-        )
-        .unwrap(),
+        utils::get_compressed_content(dd.join("first/second/third/file1.txt.zst")),
         "1st file in first"
     );
 

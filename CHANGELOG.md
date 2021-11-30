@@ -11,3 +11,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 * basic functions
 * some few tests
+* added convert mode which will convert uncompressed files to compressed
