@@ -1,0 +1,22 @@
+image:test_image:
+  stage: image
+  needs: []
+  before_script:
+    - docker info
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/fuse-zstd-test:latest || true
+    - docker build --cache-from $CI_REGISTRY_IMAGE/fuse-zstd-test:latest --tag $CI_REGISTRY_IMAGE/fuse-zstd-test:latest --target fuse-zstd-test -f ci/Dockerfile .
+    - docker push $CI_REGISTRY_IMAGE/fuse-zstd-test:latest
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+      when: never
+    - changes:
+        - Cargo.lock
+      when: on_success
+      allow_failure: true
+
+  tags:
+    - dind

@@ -1,0 +1,9 @@
+tests:run_tests:
+  stage: tests
+  needs: []
+  image: registry.gitlab.com/big-dig-data/fuse-zstd/fuse-zstd-test:latest
+  script:
+    - cargo test
+    - cargo test --feature with_disk_inode_cache
+  tags:
+    - dind  # unfortunatelly it is required to have privileged container to mount FUSE

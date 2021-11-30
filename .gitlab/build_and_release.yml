@@ -1,0 +1,26 @@
+.version_tags_only: &version_tags_only
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9].*/'
+      when: on_success
+    - when: never
+
+release:deb:
+  stage: build
+  needs: []
+  image: registry.gitlab.com/big-dig-data/fuse-zstd/fuse-zstd-test:latest
+  script:
+    - cargo deb
+  artifacts:
+    paths:
+      - target/debian/
+  tags:
+    - bdd
+  <<: *version_tags_only
+
+release:publish:
+  stage: release
+  needs: ["release:deb"]
+  image: registry.gitlab.com/big-dig-data/fuse-zstd/fuse-zstd-test:latest
+  script:
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file target/debian/*.deb "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/fuse-zstd/${CI_COMMIT_TAG:1}/"'
+  <<: *version_tags_only
