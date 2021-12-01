@@ -27,6 +27,8 @@ use std::{
 };
 use xattr::FileExt as XattrFileExt;
 
+mod file;
+
 const TTL: Duration = Duration::from_secs(1); // 1 second
 #[cfg(not(feature = "with_disk_inode_cache"))]
 const MAX_CACHE_SIZE: usize = 65536;
@@ -177,7 +179,7 @@ impl TryFrom<fs::Metadata> for FileAttrWrapper {
 struct ZstdFS {
     compression_level: u8,
     tree_dir: PathBuf,
-    opened_files: HashMap<u64, File>,
+    opened_files: HashMap<u64, file::File>,
     #[cfg(feature = "with_disk_inode_cache")]
     inode_db: Option<Db>,
     #[cfg(not(feature = "with_disk_inode_cache"))]
@@ -488,7 +490,8 @@ impl ZstdFS {
         */
 
         // Already opened by some other process
-        if let Some(file) = self.opened_files.get(&ino) {
+        if let Some(file) = self.opened_files.get_mut(&ino) {
+            file.inc();
             let fh = file.as_raw_fd();
             return Ok(fh as u64); // file can be opened by only one process
         }
@@ -520,7 +523,7 @@ impl ZstdFS {
         // Make sure that new size is written to original directory
         source_file.sync_all().map_err(convert_io_error)?;
 
-        self.opened_files.insert(ino, target_file);
+        self.opened_files.insert(ino, target_file.into());
 
         Ok(fh as u64)
     }
@@ -564,7 +567,11 @@ impl ZstdFS {
         access_all(&mut attrs);
 
         // add to opened files
-        self.opened_files.insert(attrs.ino, opened_file);
+        if let Some(file) = self.opened_files.get_mut(&attrs.ino) {
+            file.inc();
+        } else {
+            self.opened_files.insert(attrs.ino, opened_file.into());
+        }
 
         // add inode to map
         self.set_inode_path(attrs.ino, parent_path, name)?;
@@ -590,7 +597,8 @@ impl ZstdFS {
 
     fn release_wrapper(&mut self, ino: u64) -> Result<(), libc::c_int> {
         // file will be closed and freed once this function ends
-        let file = self.opened_files.remove(&ino).ok_or(libc::EBADF)?;
+        let mut file = self.opened_files.remove(&ino).ok_or(libc::EBADF)?;
+
         let source_path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
         let dir_path = source_path.parent().unwrap().to_path_buf();
         let source_file = store_to_source_file(
@@ -600,6 +608,11 @@ impl ZstdFS {
             self.compression_level,
         )?;
         source_file.sync_all().map_err(convert_io_error)?;
+
+        // more files are opened
+        if file.dec() > 0 {
+            self.opened_files.insert(ino, file);
+        }
 
         // update caches -> new inode
         let metadata = source_file.metadata().map_err(convert_io_error)?;
@@ -1108,13 +1121,12 @@ fn main() -> io::Result<()> {
         .value_of("mount-point")
         .unwrap_or_default()
         .to_string();
-    let mut options = vec![
+    let options = vec![
         MountOption::RW,
         MountOption::FSName(data_dir.clone()),
         MountOption::AutoUnmount,
         MountOption::AllowOther,
     ];
-    options.push(MountOption::AutoUnmount);
     info!(
         "Starting fuse-zstd with compression level={}, convert={}",
         compression_level, convert,

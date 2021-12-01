@@ -213,7 +213,7 @@ mod convert {
     }
 
     #[rstest]
-    fn overlapx(mounted_fs: utils::FuseZstdProcess) {
+    fn overlap(mounted_fs: utils::FuseZstdProcess) {
         let dd = mounted_fs.data_dir();
         let mp = mounted_fs.mount_point();
 
