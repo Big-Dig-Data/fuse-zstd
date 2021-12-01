@@ -38,7 +38,7 @@ proc-mounts = "0.2"
 [package.metadata.deb]
 maintainer-scripts = "debian/"
 systemd-units = { enable = false }
-depends = "$auto"
+depends = "fuse3,libfuse3-3,libc6"
 section = "otherosfs"
 priority = "optional"
 assets = [
