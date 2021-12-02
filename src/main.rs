@@ -7,7 +7,7 @@ use log::{debug, info, warn, LevelFilter};
 #[cfg(not(feature = "with_disk_inode_cache"))]
 use lru::LruCache;
 #[cfg(feature = "with_disk_inode_cache")]
-use sled::{Db, Error as SledError};
+use sled::Db;
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -15,12 +15,7 @@ use std::{
     io::{self, Seek, SeekFrom},
     os::{
         linux::fs::MetadataExt,
-        unix::{
-            fs::{
-                DirBuilderExt, DirEntryExt, FileExt, FileTypeExt, OpenOptionsExt, PermissionsExt,
-            },
-            io::AsRawFd,
-        },
+        unix::fs::{DirEntryExt, FileExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
@@ -147,7 +142,7 @@ impl TryFrom<fs::DirEntry> for FileAttrWrapper {
     type Error = io::Error;
     fn try_from(dir_entry: fs::DirEntry) -> Result<Self, Self::Error> {
         let metadata = dir_entry.metadata()?;
-        Ok(metadata.try_into()?)
+        metadata.try_into()
     }
 }
 
@@ -251,7 +246,7 @@ impl ZstdFS {
     #[cfg(not(feature = "with_disk_inode_cache"))]
     fn del_inode_path(&mut self, ino: u64) -> Result<String, libc::c_int> {
         let db = self.inode_db.as_mut().unwrap();
-        Ok(db.pop(&ino).ok_or(libc::ENOENT)?.to_owned())
+        db.pop(&ino).ok_or(libc::ENOENT)
     }
 
     #[cfg(feature = "with_disk_inode_cache")]
@@ -297,7 +292,8 @@ impl ZstdFS {
             (p, n) if !p.is_empty() && n.is_empty() => p.to_string(),
             _ => return Err(libc::EIO),
         };
-        Ok(db.put(ino, value).map(|_| ()).unwrap_or(()))
+        let _ = db.put(ino, value);
+        Ok(())
     }
 
     fn lookup_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, libc::c_int> {
@@ -441,7 +437,7 @@ impl ZstdFS {
         // Allow access to all
         access_all(&mut attrs);
 
-        Ok(attrs.into())
+        Ok(attrs)
     }
 
     fn setattr_wrapper(
@@ -619,7 +615,7 @@ impl ZstdFS {
         } else {
             offset as u64
         };
-        Ok(file.write_at(data, offset).map_err(convert_io_error)?)
+        file.write_at(data, offset).map_err(convert_io_error)
     }
 
     fn release_wrapper(&mut self, ino: u64, fh: u64) -> Result<(), libc::c_int> {
@@ -1042,7 +1038,7 @@ impl Filesystem for ZstdFS {
         match self.mkdir_wrapper(parent, name, mode, umask) {
             Ok(attrs) => {
                 debug!("mkdir passed (ino={})", attrs.ino);
-                reply.entry(&TTL, &attrs.into(), 0);
+                reply.entry(&TTL, &attrs, 0);
             }
             Err(err) => {
                 debug!("mkdir failed (err={})", err);
