@@ -18,7 +18,7 @@ directory/file.txt
 ```
 
 ### Note
-When you added files directly to the source folder, you need to reopen them
+When you add compressed files directly to the source folder, you need to reopen them
 in mounted folder to recalculate the uncompressed size (e.g. using `head` cmd),
 othewise the files in mounted folder will displayed as empty.
 
