@@ -180,6 +180,7 @@ struct ZstdFS {
     compression_level: u8,
     tree_dir: PathBuf,
     opened_files: HashMap<u64, file::File>,
+    fh_manager: file::FileHandlerManager,
     #[cfg(feature = "with_disk_inode_cache")]
     inode_db: Option<Db>,
     #[cfg(not(feature = "with_disk_inode_cache"))]
@@ -201,6 +202,7 @@ impl ZstdFS {
             #[cfg(feature = "with_disk_inode_cache")]
             inode_dir: tempfile::tempdir()?,
             convert,
+            fh_manager: file::FileHandlerManager::new(),
         })
     }
 
@@ -469,37 +471,21 @@ impl ZstdFS {
         self.getattr_wrapper(ino)
     }
 
-    fn open_wrapper(&mut self, ino: u64, _flags: i32) -> Result<u64, libc::c_int> {
-        /*
-
-        let (read, write) = match flags & libc::O_ACCMODE {
-            libc::O_RDONLY => {
-                // Behavior is undefined, but most filesystems return EACCES
-                if flags & libc::O_TRUNC != 0 {
-                    return Err(libc::EACCES);
-                }
-                (true, false)
-            }
-            libc::O_WRONLY => (false, true),
-            libc::O_RDWR => (true, true),
-            // Exactly one access mode flag must be specified
-            _ => {
-                return Err(libc::EINVAL);
-            }
-        };
-        */
-
+    fn open_wrapper(&mut self, ino: u64, flags: i32) -> Result<u64, libc::c_int> {
         // Already opened by some other process
         if let Some(file) = self.opened_files.get_mut(&ino) {
-            file.inc();
-            let fh = file.as_raw_fd();
+            // New file handler
+            let fh = self
+                .fh_manager
+                .insert(file::FileHandlerData { flags })
+                .ok_or(libc::EBUSY)?; // no available fh
+            file.add_fh(fh).expect("file handlers not sync well");
             return Ok(fh as u64); // file can be opened by only one process
         }
 
         let file_path = self.get_inode_path(ino)?;
         let source_file = fs::File::open(file_path).map_err(convert_io_error)?;
         let mut target_file = tempfile::tempfile().map_err(convert_io_error)?;
-        let fh = target_file.as_raw_fd();
         zstd::stream::copy_decode(
             source_file.try_clone().map_err(convert_io_error)?,
             target_file.try_clone().map_err(convert_io_error)?,
@@ -523,7 +509,17 @@ impl ZstdFS {
         // Make sure that new size is written to original directory
         source_file.sync_all().map_err(convert_io_error)?;
 
-        self.opened_files.insert(ino, target_file.into());
+        let mut target_file: file::File = target_file.into();
+
+        // New file handler
+        let fh = self
+            .fh_manager
+            .insert(file::FileHandlerData { flags })
+            .ok_or(libc::EBUSY)?; // no available fh
+        target_file.add_fh(fh).expect("file handlers not sync well");
+
+        // Store file
+        self.opened_files.insert(ino, target_file);
 
         Ok(fh as u64)
     }
@@ -544,14 +540,13 @@ impl ZstdFS {
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
     ) -> Result<(FileAttr, u64), libc::c_int> {
         // Create emtpy file in the tree dir
         let name = name.to_string_lossy().to_string() + ".zst";
         let parent_path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
 
         let opened_file = tempfile::tempfile().map_err(convert_io_error)?;
-        let fh = opened_file.as_raw_fd();
 
         // Write new file to source directory
         let source_file =
@@ -566,11 +561,19 @@ impl ZstdFS {
         // allow access to all
         access_all(&mut attrs);
 
+        // New file handler
+        let fh = self
+            .fh_manager
+            .insert(file::FileHandlerData { flags })
+            .ok_or(libc::EBUSY)?; // no available fh
+
         // add to opened files
         if let Some(file) = self.opened_files.get_mut(&attrs.ino) {
-            file.inc();
+            file.add_fh(fh).expect("file handlers not sync well");
         } else {
-            self.opened_files.insert(attrs.ino, opened_file.into());
+            let mut opened_file: file::File = opened_file.into();
+            opened_file.add_fh(fh).expect("file handlers not sync well");
+            self.opened_files.insert(attrs.ino, opened_file);
         }
 
         // add inode to map
@@ -582,7 +585,7 @@ impl ZstdFS {
     fn write_wrapper(
         &mut self,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -590,12 +593,23 @@ impl ZstdFS {
         _lock_owner: Option<u64>,
     ) -> Result<usize, libc::c_int> {
         let file = self.opened_files.get_mut(&ino).ok_or(libc::EBADF)?;
-        file.write_all_at(data, offset as u64)
-            .map_err(convert_io_error)?;
-        Ok(data.len())
+
+        let fh_data = self
+            .fh_manager
+            .get(fh)
+            .expect("file handlers not sync well");
+        let offset = if fh_data.flags & libc::O_APPEND != 0 {
+            // We need to append to file -> we need to get end position
+            file.seek(SeekFrom::Start(offset as u64))
+                .map_err(convert_io_error)?;
+            file.seek(SeekFrom::End(0)).map_err(convert_io_error)?
+        } else {
+            offset as u64
+        };
+        Ok(file.write_at(data, offset).map_err(convert_io_error)?)
     }
 
-    fn release_wrapper(&mut self, ino: u64) -> Result<(), libc::c_int> {
+    fn release_wrapper(&mut self, ino: u64, fh: u64) -> Result<(), libc::c_int> {
         // file will be closed and freed once this function ends
         let mut file = self.opened_files.remove(&ino).ok_or(libc::EBADF)?;
 
@@ -609,10 +623,15 @@ impl ZstdFS {
         )?;
         source_file.sync_all().map_err(convert_io_error)?;
 
-        // more files are opened
-        if file.dec() > 0 {
+        // Remove file handlers
+        let fh_size = file.del_fh(fh).expect("file handlers not sync well");
+        if fh_size > 0 {
+            // more files are opened
             self.opened_files.insert(ino, file);
         }
+        self.fh_manager
+            .remove(fh)
+            .expect("file handlers not sync well");
 
         // update caches -> new inode
         let metadata = source_file.metadata().map_err(convert_io_error)?;
@@ -899,7 +918,7 @@ impl Filesystem for ZstdFS {
         reply: fuser::ReplyEmpty,
     ) {
         debug!("Release (inode={}, fh={})", ino, fh);
-        match self.release_wrapper(ino) {
+        match self.release_wrapper(ino, fh) {
             Ok(()) => {
                 debug!("released");
                 reply.ok();

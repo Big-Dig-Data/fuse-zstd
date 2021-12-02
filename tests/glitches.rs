@@ -1,6 +1,15 @@
 use rstest::*;
-use std::{fs, io::Write, mem, os::linux::fs::MetadataExt, path};
-use xattr::FileExt;
+use std::{
+    fs,
+    io::Write,
+    mem,
+    os::linux::fs::MetadataExt,
+    os::unix::{
+        fs::FileExt,
+        io::{AsRawFd, RawFd},
+    },
+    path,
+};
 use zstd::block::compress;
 
 #[path = "utils.rs"]
@@ -50,5 +59,30 @@ fn parallel_write(mounted_fs: utils::FuseZstdProcess) {
 
     let dd_data = parallel_write(dd);
     let mp_data = parallel_write(mp);
+    assert_eq!(dd_data, mp_data);
+}
+
+#[rstest]
+fn append(mounted_fs: utils::FuseZstdProcess) {
+    // parallel open should behave in the same way as in data_dir
+    let mp = mounted_fs.mount_point();
+    let dd = mounted_fs.data_dir();
+
+    let append = |path: path::PathBuf| {
+        fs::write(path.join("file.txt"), b"BASIC").unwrap();
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path.join("file.txt"))
+            .unwrap();
+
+        file.write(b"APPENDED").unwrap();
+        mem::drop(file);
+
+        fs::read_to_string(path.join("file.txt")).unwrap()
+    };
+
+    let dd_data = append(dd);
+    let mp_data = append(mp);
     assert_eq!(dd_data, mp_data);
 }
