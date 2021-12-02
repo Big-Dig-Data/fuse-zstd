@@ -477,7 +477,10 @@ impl ZstdFS {
             // New file handler
             let fh = self
                 .fh_manager
-                .insert(file::FileHandlerData { flags })
+                .insert(file::FileHandlerData {
+                    flags,
+                    needs_sync: false,
+                })
                 .ok_or(libc::EBUSY)?; // no available fh
             file.add_fh(fh).expect("file handlers not sync well");
             return Ok(fh as u64); // file can be opened by only one process
@@ -514,7 +517,10 @@ impl ZstdFS {
         // New file handler
         let fh = self
             .fh_manager
-            .insert(file::FileHandlerData { flags })
+            .insert(file::FileHandlerData {
+                flags,
+                needs_sync: false,
+            })
             .ok_or(libc::EBUSY)?; // no available fh
         target_file.add_fh(fh).expect("file handlers not sync well");
 
@@ -554,7 +560,7 @@ impl ZstdFS {
         source_file.sync_all().map_err(convert_io_error)?;
 
         // Obtain attrs of the new file
-        let faw = FileAttrWrapper::try_from(source_file.metadata().map_err(convert_io_error)?)
+        let faw = FileAttrWrapper::try_from(opened_file.metadata().map_err(convert_io_error)?)
             .map_err(convert_io_error)?;
         let mut attrs: FileAttr = faw.into();
 
@@ -564,7 +570,10 @@ impl ZstdFS {
         // New file handler
         let fh = self
             .fh_manager
-            .insert(file::FileHandlerData { flags })
+            .insert(file::FileHandlerData {
+                flags,
+                needs_sync: false,
+            })
             .ok_or(libc::EBUSY)?; // no available fh
 
         // add to opened files
@@ -596,8 +605,12 @@ impl ZstdFS {
 
         let fh_data = self
             .fh_manager
-            .get(fh)
+            .get_mut(fh)
             .expect("file handlers not sync well");
+
+        // File should be synced to source dir
+        fh_data.needs_sync = true;
+
         let offset = if fh_data.flags & libc::O_APPEND != 0 {
             // We need to append to file -> we need to get end position
             file.seek(SeekFrom::Start(offset as u64))
@@ -613,15 +626,31 @@ impl ZstdFS {
         // file will be closed and freed once this function ends
         let mut file = self.opened_files.remove(&ino).ok_or(libc::EBADF)?;
 
-        let source_path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
-        let dir_path = source_path.parent().unwrap().to_path_buf();
-        let source_file = store_to_source_file(
-            &file,
-            &dir_path,
-            source_path.file_name().unwrap(),
-            self.compression_level,
-        )?;
-        source_file.sync_all().map_err(convert_io_error)?;
+        let needs_sync = self
+            .fh_manager
+            .get(fh)
+            .expect("file handlers not sync well")
+            .needs_sync;
+
+        if needs_sync {
+            let source_path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
+            let dir_path = source_path.parent().unwrap().to_path_buf();
+            let source_file = store_to_source_file(
+                &file,
+                &dir_path,
+                source_path.file_name().unwrap(),
+                self.compression_level,
+            )?;
+            source_file.sync_all().map_err(convert_io_error)?;
+
+            // update caches -> new inode
+            let metadata = source_file.metadata().map_err(convert_io_error)?;
+
+            // inode changed -> set new inode path
+            // also keep the original inode -> path mapping
+            // so that it can be used for further querying
+            self.set_inode_path(metadata.st_ino(), source_path, "")?;
+        }
 
         // Remove file handlers
         let fh_size = file.del_fh(fh).expect("file handlers not sync well");
@@ -632,14 +661,6 @@ impl ZstdFS {
         self.fh_manager
             .remove(fh)
             .expect("file handlers not sync well");
-
-        // update caches -> new inode
-        let metadata = source_file.metadata().map_err(convert_io_error)?;
-
-        // inode changed -> set new inode path
-        // also keep the original inode -> path mapping
-        // so that it can be used for further querying
-        self.set_inode_path(metadata.st_ino(), source_path, "")?;
 
         Ok(())
     }
@@ -723,6 +744,24 @@ impl ZstdFS {
 
         // Update inode mapping
         self.set_inode_path(ino, to_parent_path, newname)?;
+
+        Ok(())
+    }
+
+    fn fsync_wrapper(&mut self, ino: u64, fh: u64, _datasync: bool) -> Result<(), libc::c_int> {
+        let path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
+        let file = self.opened_files.get(&ino).ok_or(libc::ENOENT)?;
+        let name = path.file_name().unwrap();
+        let parent_path = path.parent().unwrap();
+
+        let source_file = store_to_source_file(file, &parent_path, &name, self.compression_level)?;
+        source_file.sync_all().map_err(convert_io_error)?;
+
+        // Update the file handler -> no need to flush afterwards
+        self.fh_manager
+            .get_mut(fh)
+            .expect("file handlers not sync well")
+            .needs_sync = false;
 
         Ok(())
     }
@@ -1061,6 +1100,27 @@ impl Filesystem for ZstdFS {
             }
             Err(err) => {
                 debug!("rename failed (err={})", err);
+                reply.error(err);
+            }
+        }
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("Fsync (ino={}, fh={:?}, datasync={:?}", ino, fh, datasync);
+        match self.fsync_wrapper(ino, fh, datasync) {
+            Ok(()) => {
+                debug!("fsync passed");
+                reply.ok();
+            }
+            Err(err) => {
+                debug!("fsync failed (err={})", err);
                 reply.error(err);
             }
         }

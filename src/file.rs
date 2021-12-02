@@ -56,6 +56,7 @@ impl DerefMut for File {
 
 pub struct FileHandlerData {
     pub flags: i32,
+    pub needs_sync: bool,
 }
 
 pub struct FileHandlerManager {
@@ -85,5 +86,9 @@ impl FileHandlerManager {
 
     pub fn get(&self, fh: u64) -> Option<&FileHandlerData> {
         self.fh_data.get(&fh)
+    }
+
+    pub fn get_mut(&mut self, fh: u64) -> Option<&mut FileHandlerData> {
+        self.fh_data.get_mut(&fh)
     }
 }
