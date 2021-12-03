@@ -556,7 +556,7 @@ impl ZstdFS {
         source_file.sync_all().map_err(convert_io_error)?;
 
         // Obtain attrs of the new file
-        let faw = FileAttrWrapper::try_from(opened_file.metadata().map_err(convert_io_error)?)
+        let faw = FileAttrWrapper::try_from(source_file.metadata().map_err(convert_io_error)?)
             .map_err(convert_io_error)?;
         let mut attrs: FileAttr = faw.into();
 
