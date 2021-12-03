@@ -1,9 +1,10 @@
+use log::debug;
+use lru_time_cache::LruCache;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io,
-    ops::{Deref, DerefMut},
     rc::Rc,
+    time::Duration,
 };
 
 pub struct OpenedFiles {
@@ -120,5 +121,73 @@ impl OpenedFiles {
 
     pub fn get_fhs(&self, ino: u64) -> Option<&HashSet<u64>> {
         self.inode_mapping.get(&ino)
+    }
+}
+
+const TTL: u64 = 5000; // default 5 seconds dcache of kernel should be 1 second
+
+struct OverridenInode {
+    pub ino_successor: u64,
+    pub file: File, // keep opened file to preserve inode so it is not reused in original fs
+}
+
+pub struct OverridenInodes {
+    mapping: LruCache<u64, OverridenInode>,
+}
+
+impl OverridenInodes {
+    pub fn new() -> Self {
+        Self {
+            mapping: LruCache::with_expiry_duration(Duration::from_millis(TTL)),
+        }
+    }
+
+    pub fn get(&mut self, ino: u64) -> Option<u64> {
+        if let Some(oi) = self.mapping.get(&ino) {
+            debug!("Overriden inode {} -> {}", ino, oi.ino_successor);
+            Some(oi.ino_successor)
+        } else {
+            None
+        }
+    }
+
+    pub fn insert(&mut self, old_ino: u64, new_ino: u64, file: File) {
+        // Update exsiting mappings so no chain created
+        let keys = self
+            .mapping
+            .peek_iter()
+            .map(|(k, _)| *k)
+            .filter(|e| *e == old_ino)
+            .collect::<Vec<u64>>();
+        for key in keys {
+            self.mapping.get_mut(&key).unwrap().ino_successor = new_ino;
+        }
+        self.mapping.insert(
+            old_ino,
+            OverridenInode {
+                file,
+                ino_successor: new_ino,
+            },
+        );
+    }
+
+    pub fn remove(&mut self, ino: u64) {
+        let keys = self
+            .mapping
+            .peek_iter()
+            .filter_map(|(k, v)| {
+                if v.ino_successor == ino {
+                    Some(*k)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for key in keys {
+            self.mapping.remove(&key).unwrap();
+        }
+
+        self.mapping.remove(&ino);
     }
 }

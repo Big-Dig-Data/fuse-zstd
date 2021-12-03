@@ -9,13 +9,6 @@ use std::{
 use tempfile::TempDir;
 use zstd::decode_all;
 
-pub fn sync_file<P>(path: P)
-where
-    P: AsRef<Path>,
-{
-    fs::File::open(path).unwrap().sync_all().unwrap();
-}
-
 pub fn get_compressed_content<P>(path: P) -> String
 where
     P: AsRef<Path>,

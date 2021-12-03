@@ -5,7 +5,7 @@ use fuser::{
 };
 use log::{debug, info, warn, LevelFilter};
 #[cfg(not(feature = "with_disk_inode_cache"))]
-use lru::LruCache;
+use lru_time_cache::LruCache;
 #[cfg(feature = "with_disk_inode_cache")]
 use sled::Db;
 use std::{
@@ -92,7 +92,7 @@ fn store_to_source_file<P1, P2>(
     dir_path: P1,
     name: P2,
     compression_level: u8,
-) -> Result<fs::File, libc::c_int>
+) -> Result<(fs::File, Option<fs::File>), libc::c_int>
 where
     P1: AsRef<Path>,
     P2: AsRef<Path>,
@@ -100,6 +100,7 @@ where
     // Atomically creates file in source directory
     let tmp_file = tempfile::NamedTempFile::new_in(dir_path.as_ref()).map_err(convert_io_error)?;
     let path = dir_path.as_ref().join(name.as_ref());
+    let orig_file = fs::File::open(&path).ok();
     source.sync_all().map_err(convert_io_error)?;
 
     let real_size = source.metadata().map_err(convert_io_error)?.st_size();
@@ -134,7 +135,7 @@ where
     file.set_xattr("user.real_size", &real_size.to_be_bytes())
         .map_err(convert_io_error)?;
 
-    Ok(file)
+    Ok((file, orig_file))
 }
 
 impl TryFrom<fs::DirEntry> for FileAttrWrapper {
@@ -183,6 +184,7 @@ struct ZstdFS {
     /// Convert uncompressed data from original directory
     /// to compressed files
     convert: bool,
+    overriden_inodes: file::OverridenInodes,
 }
 
 impl ZstdFS {
@@ -195,6 +197,7 @@ impl ZstdFS {
             #[cfg(feature = "with_disk_inode_cache")]
             inode_dir: tempfile::tempdir()?,
             convert,
+            overriden_inodes: file::OverridenInodes::new(),
         })
     }
 
@@ -243,7 +246,7 @@ impl ZstdFS {
     #[cfg(not(feature = "with_disk_inode_cache"))]
     fn del_inode_path(&mut self, ino: u64) -> Result<String, libc::c_int> {
         let db = self.inode_db.as_mut().unwrap();
-        db.pop(&ino).ok_or(libc::ENOENT)
+        db.remove(&ino).ok_or(libc::ENOENT)
     }
 
     #[cfg(feature = "with_disk_inode_cache")]
@@ -289,7 +292,7 @@ impl ZstdFS {
             (p, n) if !p.is_empty() && n.is_empty() => p.to_string(),
             _ => return Err(libc::EIO),
         };
-        let _ = db.put(ino, value);
+        let _ = db.insert(ino, value);
         Ok(())
     }
 
@@ -339,7 +342,7 @@ impl ZstdFS {
                 {
                     let zname = format!("{}.zst", &name);
                     let source_file = fs::File::open(path.join(&name)).map_err(convert_io_error)?;
-                    let file =
+                    let (file, _) =
                         store_to_source_file(&source_file, &path, &zname, self.compression_level)?;
                     file.sync_all().map_err(convert_io_error)?;
 
@@ -423,6 +426,9 @@ impl ZstdFS {
     }
 
     fn getattr_wrapper(&mut self, ino: u64) -> Result<FileAttr, libc::c_int> {
+        // try use override cache
+        let ino = self.overriden_inodes.get(ino).unwrap_or(ino);
+
         let file_path = self.get_inode_path(ino)?;
         let file = fs::File::open(file_path).map_err(convert_io_error)?;
         let metadata = file.metadata().map_err(convert_io_error)?;
@@ -453,6 +459,9 @@ impl ZstdFS {
         _bkuptime: Option<std::time::SystemTime>,
         _flags: Option<u32>,
     ) -> Result<FileAttr, libc::c_int> {
+        // try use override cache
+        let ino = self.overriden_inodes.get(ino).unwrap_or(ino);
+
         // TODO allow setting other arguments
 
         // Truncate if required
@@ -480,6 +489,9 @@ impl ZstdFS {
     }
 
     fn open_wrapper(&mut self, ino: u64, flags: i32) -> Result<u64, libc::c_int> {
+        // try use override cache
+        let ino = self.overriden_inodes.get(ino).unwrap_or(ino);
+
         // Already opened by some other process
         if let Some(fh) = self.opened_files.duplicate(ino, flags) {
             return Ok(fh); // file can be opened by only one process
@@ -552,7 +564,7 @@ impl ZstdFS {
         let opened_file = tempfile::tempfile().map_err(convert_io_error)?;
 
         // Write new file to source directory
-        let source_file =
+        let (source_file, _) =
             store_to_source_file(&opened_file, &parent_path, &name, self.compression_level)?;
         source_file.sync_all().map_err(convert_io_error)?;
 
@@ -615,7 +627,7 @@ impl ZstdFS {
                 let source_path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
                 let dir_path = source_path.parent().unwrap().to_path_buf();
 
-                let source_file = store_to_source_file(
+                let (source_file, orig_file) = store_to_source_file(
                     &file_handler.file,
                     &dir_path,
                     source_path.file_name().unwrap(),
@@ -631,6 +643,11 @@ impl ZstdFS {
                 // so that it can be used for further querying
                 debug!("New inode {}", metadata.st_ino());
                 self.opened_files.update_ino(ino, metadata.st_ino());
+                // Store overriden inode to be at least queried as long ans dcache record
+                if let Some(orig_file) = orig_file {
+                    self.overriden_inodes
+                        .insert(ino, metadata.st_ino(), orig_file);
+                }
                 self.set_inode_path(metadata.st_ino(), source_path, "")?;
             }
         }
@@ -669,6 +686,7 @@ impl ZstdFS {
         self.del_inode_path(ino)?;
         // Update opened files
         self.opened_files.unlink(ino);
+        self.overriden_inodes.remove(ino);
         Ok(())
     }
 
@@ -715,10 +733,15 @@ impl ZstdFS {
         let to_parent_path = Path::new(&self.get_inode_path(newparent)?).to_path_buf();
         let to_path = to_parent_path.join(&newname);
 
+        let orig_ino = fs::metadata(&to_path).ok().map(|e| e.st_ino());
+
         fs::rename(from_path, &to_path).map_err(convert_io_error)?;
 
         // Update inode mapping
         self.set_inode_path(ino, to_parent_path, newname)?;
+        if let Some(orig_ino) = orig_ino {
+            self.overriden_inodes.remove(orig_ino);
+        }
 
         Ok(())
     }
@@ -731,7 +754,7 @@ impl ZstdFS {
             let file_handler = self.opened_files.get_mut(fh).ok_or(libc::ENOENT)?;
             let name = path.file_name().unwrap();
             let parent_path = path.parent().unwrap();
-            let source_file = store_to_source_file(
+            let (source_file, orig_file) = store_to_source_file(
                 &file_handler.file,
                 &parent_path,
                 &name,
@@ -748,6 +771,10 @@ impl ZstdFS {
             // so that it can be used for further querying
             debug!("New inode {}", metadata.st_ino());
             self.opened_files.update_ino(ino, metadata.st_ino());
+            if let Some(orig_file) = orig_file {
+                self.overriden_inodes
+                    .insert(ino, metadata.st_ino(), orig_file);
+            }
             self.set_inode_path(metadata.st_ino(), path, "")?;
         }
 
@@ -766,7 +793,7 @@ impl Filesystem for ZstdFS {
         #[cfg(feature = "with_disk_inode_cache")]
         let inode_db = sled::open(self.inode_dir()).map_err(convert_sled_error)?;
         #[cfg(not(feature = "with_disk_inode_cache"))]
-        let inode_db = LruCache::new(MAX_CACHE_SIZE);
+        let inode_db = LruCache::with_capacity(MAX_CACHE_SIZE);
         /*
         // Note that it won't be reasonable to do this if there are millions of files
         debug!("Refreshing inode list");

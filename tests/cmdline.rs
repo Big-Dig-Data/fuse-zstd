@@ -127,9 +127,10 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
         .success()
         .stdout("new file content");
 
-    // Make sure that all the changes are written
-    // Target directory needs to be synced due to inode update
-    utils::sync_file(dd.join("first/second/"));
+    assert_eq!(
+        fs::read_to_string(&mp.join("first/second/file-new.txt")).unwrap(),
+        "new file content"
+    );
 
     let zfile = dd.join("first/second/file-new.txt.zst");
     assert_eq!(utils::get_compressed_content(zfile), "new file content");
@@ -141,9 +142,11 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
         .assert()
         .success()
         .stdout("truncated");
-    // Make sure that all the changes are written
-    // Target directory needs to be synced due to inode update
-    utils::sync_file(dd.join("first/"));
+
+    assert_eq!(
+        fs::read_to_string(&mp.join("first/file1.txt")).unwrap(),
+        "truncated"
+    );
 
     let zfile = dd.join("first/file1.txt.zst");
     assert_eq!(utils::get_compressed_content(zfile), "truncated");
@@ -156,9 +159,11 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
         .assert()
         .success()
         .stdout(" and appended");
-    // Make sure that all the changes are written
-    // Target directory needs to be synced due to inode update
-    utils::sync_file(dd.join("first/"));
+
+    assert_eq!(
+        fs::read_to_string(&mp.join("first/file1.txt")).unwrap(),
+        "truncated and appended"
+    );
 
     let zfile = dd.join("first/file1.txt.zst");
     assert_eq!(

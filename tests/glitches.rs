@@ -92,14 +92,9 @@ fn source_file_updates(mounted_fs: utils::FuseZstdProcess) {
     let mp = mounted_fs.mount_point();
     let dd = mounted_fs.data_dir();
 
-    let clean_lookup_cache = || {
-        // read parent directory -> lookup cache should be reloaded
-        fs::read_dir(mp.clone()).unwrap().count();
-    };
-
     // Create file and make sure it is sync
     fs::write(mp.join("file.txt"), b"KEEP").unwrap();
-    clean_lookup_cache();
+    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "KEEP");
 
     // no write, no fsync
     let original_ino = fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino();
@@ -146,8 +141,6 @@ fn source_file_updates(mounted_fs: utils::FuseZstdProcess) {
     mem::drop(file2);
 
     // write, no sync
-    let original_ino = fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino();
-
     let file1 = fs::OpenOptions::new()
         .write(true)
         .open(mp.join("file.txt"))
@@ -160,19 +153,7 @@ fn source_file_updates(mounted_fs: utils::FuseZstdProcess) {
 
     file2.write(b"IT").unwrap();
     mem::drop(file1);
-    clean_lookup_cache();
-
-    assert_eq!(
-        original_ino,
-        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
-        "Update file wasn't closed yet",
-    );
+    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "KEEP");
     mem::drop(file2);
-    clean_lookup_cache();
-
-    assert_ne!(
-        original_ino,
-        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
-        "Second file was closed => sync was performed",
-    );
+    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "KEEPIT");
 }
