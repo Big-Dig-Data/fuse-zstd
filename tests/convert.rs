@@ -142,7 +142,6 @@ mod no_convert {
         let dd = mounted_fs.data_dir();
         let mp = mounted_fs.mount_point();
 
-        std::thread::sleep(std::time::Duration::from_secs(1));
         assert!(dd.join("overlap.txt").exists());
         assert!(dd.join("overlap.txt.zst").exists());
         assert!(mp.join("overlap.txt").exists());
