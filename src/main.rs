@@ -1147,7 +1147,7 @@ impl Filesystem for ZstdFS {
 }
 
 fn main() -> io::Result<()> {
-    let matches = App::new(crate_name!())
+    let app = App::new(crate_name!())
         .version(crate_version!())
         .author(crate_authors!())
         .arg(
@@ -1188,8 +1188,19 @@ fn main() -> io::Result<()> {
             Arg::with_name("convert")
                 .long("convert")
                 .help("Will convert files uncompressed files from data dir"),
-        )
-        .get_matches();
+        );
+
+    #[cfg(feature = "sentry")]
+    let app = app.arg(
+        Arg::with_name("sentry-url")
+            .long("sentry-url")
+            .default_value("")
+            .help("Sentry url where events will be sent")
+            .env("FUSE_ZSTD_SENTRY_URL")
+            .takes_value(true),
+    );
+
+    let matches = app.get_matches();
 
     let verbosity: u64 = matches.occurrences_of("v");
     let convert: bool = matches.is_present("convert");
@@ -1214,7 +1225,26 @@ fn main() -> io::Result<()> {
         compression_level
     };
 
-    env_logger::builder().filter_level(log_level).init();
+    #[cfg(feature = "sentry")]
+    let _guard = if let Some(url) = matches.value_of("sentry-url") {
+        let mut log_builder = env_logger::builder();
+        log_builder.filter_level(log_level);
+        let logger = sentry_log::SentryLogger::with_dest(log_builder.build());
+
+        log::set_boxed_logger(Box::new(logger)).unwrap();
+        log::set_max_level(log_level);
+        Some(sentry::init((
+            url,
+            sentry::ClientOptions {
+                release: sentry::release_name!(),
+                ..Default::default()
+            },
+        )))
+    } else {
+        env_logger::builder().filter_level(log_level).init();
+        None
+    };
+
     let mountpoint: String = matches
         .value_of("mount-point")
         .unwrap_or_default()

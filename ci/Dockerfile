@@ -8,7 +8,7 @@ RUN \
 	apt-get -y upgrade && \
 	apt-get -y install --no-install-recommends \
 		ca-certificates git cmake make pkg-config gcc g++ openssh-client \
-		curl locales libfuse3-dev fuse3 \
+		curl locales libfuse3-dev fuse3 libssl-dev \
 		&& \
 	rm -rf /var/lib/apt/lists/*
 

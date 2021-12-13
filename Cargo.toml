@@ -17,6 +17,9 @@ default = []
 with_disk_inode_cache = [
 	"sled"
 ]
+with_sentry = [
+	"sentry"
+]
 
 [dependencies]
 clap = "2"
@@ -25,6 +28,8 @@ fuser = "0.9"
 libc = "0.2.108"
 log = "0.4"
 lru_time_cache = "0.11"
+sentry = { version = "0.23.0", features = ["log"], optional = true }
+sentry-log = "0.23.0"
 sled = { version = "0.34", optional = true}
 tempfile = "3"
 xattr = "0.2"
@@ -41,6 +46,7 @@ systemd-units = { enable = false }
 depends = "fuse3,libfuse3-3,libc6"
 section = "otherosfs"
 priority = "optional"
+features = ["sentry"]
 assets = [
     ["debian/fuse-zstd.env", "etc/conf.d/", "644"],
     ["target/release/fuse-zstd", "usr/bin/", "755"],
