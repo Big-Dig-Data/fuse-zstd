@@ -128,6 +128,7 @@ const TTL: u64 = 5000; // default 5 seconds dcache of kernel should be 1 second
 
 struct OverridenInode {
     pub ino_successor: u64,
+    #[allow(dead_code)]
     pub file: File, // keep opened file to preserve inode so it is not reused in original fs
 }
 

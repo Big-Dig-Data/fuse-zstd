@@ -443,6 +443,7 @@ impl ZstdFS {
         Ok(attrs)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn setattr_wrapper(
         &mut self,
         ino: u64,
@@ -588,6 +589,7 @@ impl ZstdFS {
         Ok((attrs, fh as u64))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_wrapper(
         &mut self,
         _ino: u64,
