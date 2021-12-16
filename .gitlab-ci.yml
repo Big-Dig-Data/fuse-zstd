@@ -8,3 +8,4 @@ include:
   - local: /.gitlab/test-image.yml
   - local: /.gitlab/run-tests.yml
   - local: /.gitlab/build_and_release.yml
+  - local: /.gitlab/sentry.yml
