@@ -1244,6 +1244,8 @@ fn main() -> io::Result<()> {
         env_logger::builder().filter_level(log_level).init();
         None
     };
+    #[cfg(not(feature = "sentry"))]
+    env_logger::builder().filter_level(log_level).init();
 
     let mountpoint: String = matches
         .value_of("mount-point")
