@@ -117,7 +117,7 @@ where
     )
     .map_err(convert_io_error)?;
     encoder
-        .include_contentsize(true)
+        .set_pledged_src_size(Some(real_size))
         .map_err(convert_io_error)?;
     encoder.include_checksum(true).map_err(convert_io_error)?;
     io::copy(&mut cloned_source, &mut encoder).map_err(convert_io_error)?;
