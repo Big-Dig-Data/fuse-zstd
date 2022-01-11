@@ -685,8 +685,12 @@ impl ZstdFS {
         let path = parent_path.join(name.to_string_lossy().to_string() + ".zst");
         let ino = fs::metadata(&path).map_err(convert_io_error)?.st_ino();
         fs::remove_file(path).map_err(convert_io_error)?;
-        self.del_inode_path(ino)?;
-        // Update opened files
+        if self.convert {
+            // removing e.g. file which hasn't been converted yet
+            let _ = self.del_inode_path(ino);
+        } else {
+            self.del_inode_path(ino)?;
+        }
         self.opened_files.unlink(ino);
         self.overriden_inodes.remove(ino);
         Ok(())

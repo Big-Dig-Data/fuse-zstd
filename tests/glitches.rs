@@ -16,13 +16,21 @@ use zstd::block::compress;
 pub mod utils;
 
 #[fixture]
-fn mounted_fs() -> utils::FuseZstdProcess {
+fn mounted_fs_no_convert() -> utils::FuseZstdProcess {
     let zstd_process = utils::FuseZstdProcess::new(false);
     zstd_process
 }
 
+#[fixture]
+fn mounted_fs_convert() -> utils::FuseZstdProcess {
+    let zstd_process = utils::FuseZstdProcess::new(true);
+    zstd_process
+}
+
 #[rstest]
-fn parallel_write(mounted_fs: utils::FuseZstdProcess) {
+#[case::no_convert(mounted_fs_no_convert())]
+#[case::convert(mounted_fs_convert())]
+fn parallel_write(#[case] mounted_fs: utils::FuseZstdProcess) {
     // parallel open should behave in the same way as in data_dir
     let mp = mounted_fs.mount_point();
     let dd = mounted_fs.data_dir();
@@ -48,22 +56,27 @@ fn parallel_write(mounted_fs: utils::FuseZstdProcess) {
 
         file2.write(b"SECOND").unwrap();
         file1.write(b"FIRST").unwrap();
+        file1.sync_all().unwrap();
         mem::drop(file1); // should close the file
 
         file3.write(b"THIRD").unwrap();
+        file2.sync_all().unwrap();
         mem::drop(file2); // should close the file
+        file3.sync_all().unwrap();
         mem::drop(file3); // should close the file
 
         fs::read_to_string(path.join("file.txt")).unwrap()
     };
 
-    let dd_data = parallel_write(dd);
     let mp_data = parallel_write(mp);
+    let dd_data = parallel_write(dd);
     assert_eq!(dd_data, mp_data);
 }
 
 #[rstest]
-fn append(mounted_fs: utils::FuseZstdProcess) {
+#[case::no_convert(mounted_fs_no_convert())]
+#[case::convert(mounted_fs_convert())]
+fn append(#[case] mounted_fs: utils::FuseZstdProcess) {
     // parallel open should behave in the same way as in data_dir
     let mp = mounted_fs.mount_point();
     let dd = mounted_fs.data_dir();
@@ -77,6 +90,7 @@ fn append(mounted_fs: utils::FuseZstdProcess) {
             .unwrap();
 
         file.write(b"APPENDED").unwrap();
+        file.sync_all().unwrap();
         mem::drop(file);
 
         fs::read_to_string(path.join("file.txt")).unwrap()
@@ -88,7 +102,9 @@ fn append(mounted_fs: utils::FuseZstdProcess) {
 }
 
 #[rstest]
-fn source_file_updates(mounted_fs: utils::FuseZstdProcess) {
+#[case::no_convert(mounted_fs_no_convert())]
+#[case::convert(mounted_fs_convert())]
+fn source_file_updates(#[case] mounted_fs: utils::FuseZstdProcess) {
     let mp = mounted_fs.mount_point();
     let dd = mounted_fs.data_dir();
 
@@ -156,4 +172,34 @@ fn source_file_updates(mounted_fs: utils::FuseZstdProcess) {
     assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "KEEP");
     mem::drop(file2);
     assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "KEEPIT");
+}
+
+#[rstest]
+#[case::convert(mounted_fs_convert())]
+fn remove_unconverted_file(#[case] mounted_fs: utils::FuseZstdProcess) {
+    let mp = mounted_fs.mount_point();
+    let dd = mounted_fs.data_dir();
+
+    {
+        let mut file1 = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(dd.join("file.txt"))
+            .unwrap();
+        file1.write(b"UNCONVERTED").unwrap();
+        file1.sync_all().unwrap();
+        fs::create_dir_all(dd.join("dir")).unwrap();
+
+        let mut file2 = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(dd.join("dir/file.txt"))
+            .unwrap();
+        file2.write(b"UNCONVERTED").unwrap();
+        file2.sync_all().unwrap();
+    }
+    assert!(fs::remove_file(mp.join("file.txt")).is_ok());
+    assert!(!mp.join("file.txt").exists());
+    assert!(fs::remove_file(mp.join("dir/file.txt")).is_ok());
+    assert!(!mp.join("dir/file.txt").exists());
 }
