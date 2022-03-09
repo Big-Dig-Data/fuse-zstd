@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use rstest::*;
-use std::{fs, path};
+use std::fs;
 use zstd::decode_all;
 
 #[path = "utils.rs"]

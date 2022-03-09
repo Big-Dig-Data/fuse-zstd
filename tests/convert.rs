@@ -1,6 +1,6 @@
 use std::{fs, os::linux::fs::MetadataExt, path};
 use xattr::FileExt;
-use zstd::block::compress;
+use zstd::bulk::compress;
 
 #[path = "utils.rs"]
 pub mod utils;
@@ -101,7 +101,7 @@ where
 mod no_convert {
     use super::utils;
     use rstest::*;
-    use std::{fs, mem, os::linux::fs::MetadataExt};
+    use std::fs;
 
     #[fixture]
     fn mounted_fs() -> utils::FuseZstdProcess {
@@ -171,7 +171,7 @@ mod no_convert {
 mod convert {
     use super::utils;
     use rstest::*;
-    use std::{fs, os::linux::fs::MetadataExt};
+    use std::fs;
 
     #[fixture]
     fn mounted_fs() -> utils::FuseZstdProcess {

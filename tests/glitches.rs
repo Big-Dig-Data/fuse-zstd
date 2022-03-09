@@ -1,16 +1,5 @@
 use rstest::*;
-use std::{
-    fs,
-    io::Write,
-    mem,
-    os::linux::fs::MetadataExt,
-    os::unix::{
-        fs::FileExt,
-        io::{AsRawFd, RawFd},
-    },
-    path,
-};
-use zstd::block::compress;
+use std::{fs, io::Write, mem, os::linux::fs::MetadataExt, path};
 
 #[path = "utils.rs"]
 pub mod utils;

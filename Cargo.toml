@@ -23,20 +23,20 @@ with_sentry = [
 
 [dependencies]
 clap = "2"
-env_logger = "0.8"
-fuser = "0.9"
-libc = "0.2.108"
+env_logger = "0.9"
+fuser = "0.11"
+libc = "0.2"
 log = "0.4"
 lru_time_cache = "0.11"
-sentry = { version = "0.23.0", features = ["log"], optional = true }
-sentry-log = "0.23.0"
+sentry = { version = "0.25.0", features = ["log"], optional = true }
+sentry-log = { version = "0.25.0", optional = true }
 sled = { version = "0.34", optional = true}
 tempfile = "3"
 xattr = "0.2"
-zstd = "0.9"
+zstd = "0.10"
 
 [dev-dependencies]
-rstest = "0.11"
+rstest = "0.12"
 assert_cmd = "2.0"
 proc-mounts = "0.2"
 
