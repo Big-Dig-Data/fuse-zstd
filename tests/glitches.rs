@@ -192,3 +192,48 @@ fn remove_unconverted_file(#[case] mounted_fs: utils::FuseZstdProcess) {
     assert!(fs::remove_file(mp.join("dir/file.txt")).is_ok());
     assert!(!mp.join("dir/file.txt").exists());
 }
+
+#[rstest]
+#[case::no_convert(mounted_fs_no_convert())]
+#[case::convert(mounted_fs_convert())]
+fn flush(#[case] mounted_fs: utils::FuseZstdProcess) {
+    let mp = mounted_fs.mount_point();
+    let dd = mounted_fs.data_dir();
+
+    // Create file and make sure it is synced
+    fs::write(mp.join("file.txt"), b"ORIGINAL").unwrap();
+    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "ORIGINAL");
+
+    let original_ino = fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino();
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(mp.join("file.txt"))
+        .unwrap();
+
+    assert_eq!(
+        original_ino,
+        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
+        "Opening file doesn't touch compressed file",
+    );
+    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "ORIGINAL");
+
+    file.write(b"OVERRIDE").unwrap();
+
+    assert_eq!(
+        original_ino,
+        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
+        "Writing doesn't touch compressed file",
+    );
+    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "ORIGINAL");
+
+    // closing cloned fd should trigger flush
+    file.try_clone().unwrap();
+
+    assert_ne!(
+        original_ino,
+        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
+        "Flushing changes compressed file",
+    );
+    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "OVERRIDE");
+}

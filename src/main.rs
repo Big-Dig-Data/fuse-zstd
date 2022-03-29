@@ -296,6 +296,55 @@ impl ZstdFS {
         Ok(())
     }
 
+    fn sync_to_fs(&mut self, fh: u64, close: bool, force_sync: bool) -> Result<(), libc::c_int> {
+        let (ino, needs_sync, file) = if close {
+            let fh = self.opened_files.close(fh).ok_or(libc::EBADF)?;
+            (fh.ino, fh.needs_sync, fh.file.clone())
+        } else {
+            let fh = self.opened_files.get(fh).ok_or(libc::ENOENT)?;
+            (fh.ino, fh.needs_sync, fh.file.clone())
+        };
+
+        if needs_sync || force_sync {
+            if let Some(ino) = ino {
+                let source_path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
+                let dir_path = source_path.parent().unwrap().to_path_buf();
+
+                let (source_file, orig_file) = store_to_source_file(
+                    &file,
+                    &dir_path,
+                    source_path.file_name().unwrap(),
+                    self.compression_level,
+                )?;
+                source_file.sync_all().map_err(convert_io_error)?;
+
+                // update caches -> new inode
+                let metadata = source_file.metadata().map_err(convert_io_error)?;
+
+                // inode changed -> set new inode path
+                // also keep the original inode -> path mapping
+                // so that it can be used for further querying
+                debug!("New inode {}", metadata.st_ino());
+                self.opened_files.update_ino(ino, metadata.st_ino());
+                // Store overriden inode to be at least queried as long ans dcache record
+                if let Some(orig_file) = orig_file {
+                    self.overriden_inodes
+                        .insert(ino, metadata.st_ino(), orig_file);
+                }
+                self.set_inode_path(metadata.st_ino(), source_path, "")?;
+
+                // update needs_update because the file was synced
+                if !close {
+                    let fh = self.opened_files.get_mut(fh).unwrap();
+                    fh.needs_sync = false;
+                } else {
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn lookup_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, libc::c_int> {
         let path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
         let entries = fs::read_dir(&path).map_err(convert_io_error)?;
@@ -622,38 +671,7 @@ impl ZstdFS {
 
     fn release_wrapper(&mut self, _ino: u64, fh: u64) -> Result<(), libc::c_int> {
         // file will be closed and freed once this function ends
-        let file_handler = self.opened_files.close(fh).ok_or(libc::EBADF)?;
-
-        if file_handler.needs_sync {
-            if let Some(ino) = file_handler.ino {
-                let source_path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
-                let dir_path = source_path.parent().unwrap().to_path_buf();
-
-                let (source_file, orig_file) = store_to_source_file(
-                    &file_handler.file,
-                    &dir_path,
-                    source_path.file_name().unwrap(),
-                    self.compression_level,
-                )?;
-                source_file.sync_all().map_err(convert_io_error)?;
-
-                // update caches -> new inode
-                let metadata = source_file.metadata().map_err(convert_io_error)?;
-
-                // inode changed -> set new inode path
-                // also keep the original inode -> path mapping
-                // so that it can be used for further querying
-                debug!("New inode {}", metadata.st_ino());
-                self.opened_files.update_ino(ino, metadata.st_ino());
-                // Store overriden inode to be at least queried as long ans dcache record
-                if let Some(orig_file) = orig_file {
-                    self.overriden_inodes
-                        .insert(ino, metadata.st_ino(), orig_file);
-                }
-                self.set_inode_path(metadata.st_ino(), source_path, "")?;
-            }
-        }
-
+        self.sync_to_fs(fh, true, false)?;
         Ok(())
     }
 
@@ -753,37 +771,12 @@ impl ZstdFS {
     }
 
     fn fsync_wrapper(&mut self, _ino: u64, fh: u64, _datasync: bool) -> Result<(), libc::c_int> {
-        let ino = self.opened_files.get(fh).ok_or(libc::ENOENT)?.ino;
+        self.sync_to_fs(fh, false, true)?;
+        Ok(())
+    }
 
-        if let Some(ino) = ino {
-            let path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
-            let file_handler = self.opened_files.get_mut(fh).ok_or(libc::ENOENT)?;
-            let name = path.file_name().unwrap();
-            let parent_path = path.parent().unwrap();
-            let (source_file, orig_file) = store_to_source_file(
-                &file_handler.file,
-                &parent_path,
-                &name,
-                self.compression_level,
-            )?;
-            source_file.sync_all().map_err(convert_io_error)?;
-            file_handler.needs_sync = false;
-
-            // update caches -> new inode
-            let metadata = source_file.metadata().map_err(convert_io_error)?;
-
-            // inode changed -> set new inode path
-            // also keep the original inode -> path mapping
-            // so that it can be used for further querying
-            debug!("New inode {}", metadata.st_ino());
-            self.opened_files.update_ino(ino, metadata.st_ino());
-            if let Some(orig_file) = orig_file {
-                self.overriden_inodes
-                    .insert(ino, metadata.st_ino(), orig_file);
-            }
-            self.set_inode_path(metadata.st_ino(), path, "")?;
-        }
-
+    fn flush_wrapper(&mut self, _ino: u64, fh: u64, _lock_owner: u64) -> Result<(), libc::c_int> {
+        self.sync_to_fs(fh, false, false)?;
         Ok(())
     }
 }
@@ -1136,7 +1129,7 @@ impl Filesystem for ZstdFS {
         datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!("Fsync (ino={}, fh={:?}, datasync={:?}", ino, fh, datasync);
+        debug!("Fsync (ino={}, fh={:?}, datasync={:?})", ino, fh, datasync);
         match self.fsync_wrapper(ino, fh, datasync) {
             Ok(()) => {
                 debug!("fsync passed");
@@ -1144,6 +1137,30 @@ impl Filesystem for ZstdFS {
             }
             Err(err) => {
                 debug!("fsync failed (err={})", err);
+                reply.error(err);
+            }
+        }
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!(
+            "Flush (ino={}, fh={:?}, lock_owner={:?}",
+            ino, fh, lock_owner
+        );
+        match self.flush_wrapper(ino, fh, lock_owner) {
+            Ok(()) => {
+                debug!("flush passed");
+                reply.ok();
+            }
+            Err(err) => {
+                debug!("flush failed (err={})", err);
                 reply.error(err);
             }
         }
