@@ -3,7 +3,7 @@ use lru_time_cache::LruCache;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    rc::Rc,
+    io,
     time::Duration,
 };
 
@@ -12,11 +12,10 @@ pub struct OpenedFiles {
     handlers: HashMap<u64, FileHandler>,
 }
 
-#[derive(Clone)]
 pub struct FileHandler {
     pub flags: i32,
     pub needs_sync: bool,
-    pub file: Rc<File>,
+    pub file: File,
     pub ino: Option<u64>,
 }
 
@@ -58,7 +57,7 @@ impl OpenedFiles {
         let _ = self.handlers.insert(
             new_fh,
             FileHandler {
-                file: Rc::new(file),
+                file,
                 flags,
                 needs_sync: false,
                 ino: Some(ino),
@@ -72,19 +71,31 @@ impl OpenedFiles {
         Some(new_fh)
     }
 
-    pub fn duplicate(&mut self, ino: u64, flags: i32) -> Option<u64> {
-        let mapping = self.inode_mapping.get(&ino)?;
+    pub fn duplicate(&mut self, ino: u64, flags: i32) -> io::Result<Option<u64>> {
+        let mapping = if let Some(mapping) = self.inode_mapping.get(&ino) {
+            mapping
+        } else {
+            return Ok(None);
+        };
+
         let fh = mapping.iter().next().unwrap(); // mapping should not be empty
         let handler = self.handlers.get(fh).unwrap(); // should contain fh
-        let new_fh = self.new_fh_number()?;
+        let new_fh = if let Some(new_fh) = self.new_fh_number() {
+            new_fh
+        } else {
+            return Ok(None);
+        };
+
+        // Duplicate file
+        let new_file = handler.file.try_clone()?;
         let new_handler = FileHandler {
             flags,
-            needs_sync: handler.needs_sync,
-            file: handler.file.clone(),
+            needs_sync: false,
+            file: new_file,
             ino: Some(ino),
         };
         let _ = self.handlers.insert(new_fh, new_handler);
-        Some(new_fh)
+        Ok(Some(new_fh))
     }
 
     pub fn close(&mut self, fh: u64) -> Option<FileHandler> {

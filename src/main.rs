@@ -299,10 +299,18 @@ impl ZstdFS {
     fn sync_to_fs(&mut self, fh: u64, close: bool, force_sync: bool) -> Result<(), libc::c_int> {
         let (ino, needs_sync, file) = if close {
             let fh = self.opened_files.close(fh).ok_or(libc::EBADF)?;
-            (fh.ino, fh.needs_sync, fh.file.clone())
+            (
+                fh.ino,
+                fh.needs_sync,
+                fh.file.try_clone().map_err(convert_io_error)?,
+            )
         } else {
             let fh = self.opened_files.get(fh).ok_or(libc::ENOENT)?;
-            (fh.ino, fh.needs_sync, fh.file.clone())
+            (
+                fh.ino,
+                fh.needs_sync,
+                fh.file.try_clone().map_err(convert_io_error)?,
+            )
         };
 
         if needs_sync || force_sync {
@@ -543,7 +551,11 @@ impl ZstdFS {
         let ino = self.overriden_inodes.get(ino).unwrap_or(ino);
 
         // Already opened by some other process
-        if let Some(fh) = self.opened_files.duplicate(ino, flags) {
+        if let Some(fh) = self
+            .opened_files
+            .duplicate(ino, flags)
+            .map_err(convert_io_error)?
+        {
             return Ok(fh); // file can be opened by only one process
         }
 
