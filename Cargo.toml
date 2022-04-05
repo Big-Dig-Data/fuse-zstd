@@ -18,7 +18,8 @@ with_disk_inode_cache = [
 	"sled"
 ]
 with_sentry = [
-	"sentry"
+	"sentry",
+	"sentry-log",
 ]
 
 [dependencies]
@@ -46,7 +47,7 @@ systemd-units = { enable = false }
 depends = "fuse3,libfuse3-3,libc6"
 section = "otherosfs"
 priority = "optional"
-features = ["sentry"]
+features = ["with_sentry"]
 assets = [
     ["debian/fuse-zstd.env", "etc/conf.d/", "644"],
     ["target/release/fuse-zstd", "usr/bin/", "755"],
