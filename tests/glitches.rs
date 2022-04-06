@@ -237,3 +237,30 @@ fn flush(#[case] mounted_fs: utils::FuseZstdProcess) {
     );
     assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "OVERRIDE");
 }
+
+#[rstest]
+//#[case::no_convert(mounted_fs_no_convert())]
+#[case::convert(mounted_fs_convert())]
+fn too_close_write_and_lookup(#[case] mounted_fs: utils::FuseZstdProcess) {
+    let mp = mounted_fs.mount_point();
+
+    let mut file1 = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(mp.join("file.txt"))
+        .unwrap();
+    file1.write(b"TOO CLOSE").unwrap();
+    mem::drop(file1);
+    assert_eq!(
+        fs::read_to_string(mp.join("file.txt")).unwrap(),
+        "TOO CLOSE"
+    );
+    let mut file1 = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(mp.join("file2.txt"))
+        .unwrap();
+    file1.write(b"2 CLOSE").unwrap();
+    mem::drop(file1);
+    assert_eq!(fs::read_to_string(mp.join("file2.txt")).unwrap(), "2 CLOSE");
+}
