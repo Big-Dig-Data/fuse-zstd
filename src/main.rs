@@ -434,7 +434,7 @@ impl ZstdFS {
             .duplicate(ino, flags)
             .map_err(convert_io_error)?
         {
-            return Ok(fh); // file can be opened by only one process
+            return Ok(fh);
         }
 
         let file_path = self.icache().get_inode_path(ino)?;
@@ -546,10 +546,14 @@ impl ZstdFS {
 
         let offset = if file_handler.flags & libc::O_APPEND != 0 {
             // We need to append to file -> we need to get end position
-            let mut file = file_handler.file.try_clone().map_err(convert_io_error)?;
-            file.seek(SeekFrom::Start(offset as u64))
+            file_handler
+                .file
+                .seek(SeekFrom::Start(offset as u64))
                 .map_err(convert_io_error)?;
-            file.seek(SeekFrom::End(0)).map_err(convert_io_error)?
+            file_handler
+                .file
+                .seek(SeekFrom::End(0))
+                .map_err(convert_io_error)?
         } else {
             offset as u64
         };
@@ -1060,7 +1064,7 @@ fn main() -> io::Result<()> {
                 .help("Will convert files uncompressed files from data dir"),
         );
 
-    #[cfg(feature = "sentry")]
+    #[cfg(feature = "with_sentry")]
     let app = app.arg(
         Arg::with_name("sentry-url")
             .long("sentry-url")
@@ -1095,7 +1099,7 @@ fn main() -> io::Result<()> {
         compression_level
     };
 
-    #[cfg(feature = "sentry")]
+    #[cfg(feature = "with_sentry")]
     let _guard = if let Some(url) = matches.value_of("sentry-url") {
         let mut log_builder = env_logger::builder();
         log_builder.filter_level(log_level);
@@ -1114,7 +1118,7 @@ fn main() -> io::Result<()> {
         env_logger::builder().filter_level(log_level).init();
         None
     };
-    #[cfg(not(feature = "sentry"))]
+    #[cfg(not(feature = "with_sentry"))]
     env_logger::builder().filter_level(log_level).init();
 
     let mountpoint: String = matches
