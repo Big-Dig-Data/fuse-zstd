@@ -1,10 +1,7 @@
-use log::debug;
-use lru_time_cache::LruCache;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io,
-    time::Duration,
 };
 
 pub struct OpenedFiles {

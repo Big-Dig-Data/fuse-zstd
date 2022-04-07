@@ -4,10 +4,6 @@ use fuser::{
     Request, FUSE_ROOT_ID,
 };
 use log::{debug, info, warn, LevelFilter};
-#[cfg(not(feature = "with_disk_inode_cache"))]
-use lru_time_cache::LruCache;
-#[cfg(feature = "with_disk_inode_cache")]
-use sled::Db;
 use std::{
     ffi::OsStr,
     fs::{self, File},
@@ -21,11 +17,8 @@ use std::{
 };
 use xattr::FileExt as XattrFileExt;
 
+mod cache;
 mod file;
-
-const TTL: Duration = Duration::from_secs(1); // 1 second
-#[cfg(not(feature = "with_disk_inode_cache"))]
-const MAX_CACHE_SIZE: usize = 65536;
 
 struct FileAttrWrapper {
     file_attr: FileAttr,
@@ -54,14 +47,6 @@ where
 {
     let err: io::Error = err.into();
     err.raw_os_error().unwrap_or(libc::EIO)
-}
-
-#[cfg(feature = "with_disk_inode_cache")]
-fn convert_sled_error(err: sled::Error) -> libc::c_int {
-    match err {
-        sled::Error::Io(ioerror) => convert_io_error(ioerror),
-        _ => libc::EIO,
-    }
 }
 
 fn convert_ft(ft: fs::FileType) -> io::Result<fuser::FileType> {
@@ -175,12 +160,7 @@ struct ZstdFS {
     compression_level: u8,
     tree_dir: PathBuf,
     opened_files: file::OpenedFiles,
-    #[cfg(feature = "with_disk_inode_cache")]
-    inode_db: Option<Db>,
-    #[cfg(not(feature = "with_disk_inode_cache"))]
-    inode_db: Option<LruCache<u64, String>>,
-    #[cfg(feature = "with_disk_inode_cache")]
-    inode_dir: tempfile::TempDir,
+    inode_cache: Option<cache::InodeCache>,
     /// Convert uncompressed data from original directory
     /// to compressed files
     convert: bool,
@@ -190,108 +170,20 @@ impl ZstdFS {
     fn new(tree_dir: String, compression_level: u8, convert: bool) -> io::Result<ZstdFS> {
         Ok(Self {
             compression_level,
+            inode_cache: None,
             tree_dir: tree_dir.into(),
             opened_files: file::OpenedFiles::new(),
-            inode_db: None,
-            #[cfg(feature = "with_disk_inode_cache")]
-            inode_dir: tempfile::tempdir()?,
             convert,
         })
-    }
-
-    #[cfg(feature = "with_disk_inode_cache")]
-    fn inode_dir(&self) -> PathBuf {
-        self.inode_dir.path().into()
     }
 
     fn tree_dir(&self) -> PathBuf {
         self.tree_dir.clone()
     }
 
-    #[cfg(feature = "with_disk_inode_cache")]
-    fn get_inode_path(&self, ino: u64) -> Result<String, libc::c_int> {
-        let db = self.inode_db.as_ref().unwrap();
-        let inodes = db.open_tree("inodes").map_err(convert_sled_error)?;
-
-        if let Some(path) = inodes.get(ino.to_be_bytes()).map_err(convert_sled_error)? {
-            Ok(String::from_utf8_lossy(&path).to_string())
-        } else {
-            Err(libc::ENOENT)
-        }
-    }
-
-    #[cfg(not(feature = "with_disk_inode_cache"))]
-    fn get_inode_path(&mut self, ino: u64) -> Result<String, libc::c_int> {
-        let db = self.inode_db.as_mut().unwrap();
-        Ok(db.get(&ino).ok_or(libc::ENOENT)?.to_owned())
-    }
-
-    #[cfg(feature = "with_disk_inode_cache")]
-    fn del_inode_path(&mut self, ino: u64) -> Result<String, libc::c_int> {
-        let db = self.inode_db.as_ref().unwrap();
-        let inodes = db.open_tree("inodes").map_err(convert_sled_error)?;
-
-        if let Some(path) = inodes
-            .remove(ino.to_be_bytes())
-            .map_err(convert_sled_error)?
-        {
-            Ok(String::from_utf8_lossy(&path).to_string())
-        } else {
-            Err(libc::ENOENT)
-        }
-    }
-
-    #[cfg(not(feature = "with_disk_inode_cache"))]
-    fn del_inode_path(&mut self, ino: u64) -> Result<String, libc::c_int> {
-        let db = self.inode_db.as_mut().unwrap();
-        db.remove(&ino).ok_or(libc::ENOENT)
-    }
-
-    #[cfg(feature = "with_disk_inode_cache")]
-    fn set_inode_path<P, N>(&mut self, ino: u64, path: P, name: N) -> Result<(), libc::c_int>
-    where
-        P: AsRef<Path>,
-        N: ToString,
-    {
-        let db = self.inode_db.as_ref().unwrap();
-        let inodes = db.open_tree("inodes").map_err(convert_sled_error)?;
-        let path: &Path = path.as_ref();
-        let path_str = path.to_string_lossy();
-        let name = name.to_string();
-        let value = match (&path_str, &name) {
-            (p, n) if !p.is_empty() && !n.is_empty() => {
-                format!("{}/{}", p, n)
-            }
-            (p, n) if p.is_empty() && !n.is_empty() => n.to_string(),
-            (p, n) if !p.is_empty() && n.is_empty() => p.to_string(),
-            _ => return Err(libc::EIO),
-        };
-        inodes
-            .insert(ino.to_be_bytes(), value.as_bytes())
-            .map_err(convert_sled_error)
-            .map(|_| ())
-    }
-
-    #[cfg(not(feature = "with_disk_inode_cache"))]
-    fn set_inode_path<P, N>(&mut self, ino: u64, path: P, name: N) -> Result<(), libc::c_int>
-    where
-        P: AsRef<Path>,
-        N: ToString,
-    {
-        let db = self.inode_db.as_mut().unwrap();
-        let path: &Path = path.as_ref();
-        let path_str = path.to_string_lossy();
-        let name = name.to_string();
-        let value = match (&path_str, &name) {
-            (p, n) if !p.is_empty() && !n.is_empty() => {
-                format!("{}/{}", p, n)
-            }
-            (p, n) if p.is_empty() && !n.is_empty() => n.to_string(),
-            (p, n) if !p.is_empty() && n.is_empty() => p.to_string(),
-            _ => return Err(libc::EIO),
-        };
-        let _ = db.insert(ino, value);
-        Ok(())
+    #[inline]
+    fn icache(&mut self) -> &mut cache::InodeCache {
+        self.inode_cache.as_mut().unwrap()
     }
 
     fn sync_to_fs(&mut self, fh: u64, close: bool, force_sync: bool) -> Result<(), libc::c_int> {
@@ -313,10 +205,10 @@ impl ZstdFS {
 
         if needs_sync || force_sync {
             if let Some(ino) = ino {
-                let source_path = Path::new(&self.get_inode_path(ino)?).to_path_buf();
+                let source_path = Path::new(&self.icache().get_inode_path(ino)?).to_path_buf();
                 let dir_path = source_path.parent().unwrap().to_path_buf();
 
-                let (source_file, orig_file) = store_to_source_file(
+                let (source_file, _) = store_to_source_file(
                     &file,
                     &dir_path,
                     source_path.file_name().unwrap(),
@@ -332,7 +224,8 @@ impl ZstdFS {
                 // so that it can be used for further querying
                 debug!("New inode {}", metadata.st_ino());
                 self.opened_files.update_ino(ino, metadata.st_ino());
-                self.set_inode_path(metadata.st_ino(), source_path, "")?;
+                self.icache()
+                    .set_inode_path(metadata.st_ino(), source_path, "")?;
 
                 // update needs_update because the file was synced
                 if !close {
@@ -347,7 +240,7 @@ impl ZstdFS {
     }
 
     fn lookup_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, libc::c_int> {
-        let path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
+        let path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
         let entries = fs::read_dir(&path).map_err(convert_io_error)?;
         let name = name.to_string_lossy().to_string();
         for entry in entries {
@@ -360,7 +253,8 @@ impl ZstdFS {
                 name.clone()
             };
             if entry.file_name().to_string_lossy() == filename {
-                self.set_inode_path(entry.ino(), &path, &filename)?;
+                self.icache()
+                    .set_inode_path(entry.ino(), &path, &filename)?;
                 let mut faw = FileAttrWrapper::try_from(entry).map_err(convert_io_error)?;
                 // Update size from extended attributes
                 let file = fs::File::open(path.join(filename)).map_err(convert_io_error)?;
@@ -409,7 +303,7 @@ impl ZstdFS {
                     // allow access to all
                     access_all(&mut attrs);
 
-                    self.set_inode_path(attrs.ino, path, zname)?;
+                    self.icache().set_inode_path(attrs.ino, path, zname)?;
 
                     return Ok(attrs);
                 }
@@ -425,7 +319,7 @@ impl ZstdFS {
         offset: i64,
         reply: &mut ReplyDirectory,
     ) -> Result<(), libc::c_int> {
-        let file_path = self.get_inode_path(ino)?;
+        let file_path = self.icache().get_inode_path(ino)?;
         let metadata = fs::metadata(&file_path).map_err(convert_io_error)?;
         if !metadata.is_dir() {
             return Err(libc::ENOTDIR);
@@ -476,7 +370,7 @@ impl ZstdFS {
     }
 
     fn getattr_wrapper(&mut self, ino: u64) -> Result<FileAttr, libc::c_int> {
-        let file_path = self.get_inode_path(ino)?;
+        let file_path = self.icache().get_inode_path(ino)?;
         let file = fs::File::open(file_path).map_err(convert_io_error)?;
         let metadata = file.metadata().map_err(convert_io_error)?;
         let mut faw: FileAttrWrapper = metadata.try_into().map_err(convert_io_error)?;
@@ -543,7 +437,7 @@ impl ZstdFS {
             return Ok(fh); // file can be opened by only one process
         }
 
-        let file_path = self.get_inode_path(ino)?;
+        let file_path = self.icache().get_inode_path(ino)?;
         let source_file = fs::File::open(file_path).map_err(convert_io_error)?;
         let mut target_file = tempfile::tempfile().map_err(convert_io_error)?;
         zstd::stream::copy_decode(
@@ -605,7 +499,7 @@ impl ZstdFS {
     ) -> Result<(FileAttr, u64), libc::c_int> {
         // Create emtpy file in the tree dir
         let name = name.to_string_lossy().to_string() + ".zst";
-        let parent_path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
+        let parent_path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
 
         let opened_file = tempfile::tempfile().map_err(convert_io_error)?;
 
@@ -629,7 +523,7 @@ impl ZstdFS {
             .ok_or(libc::EBUSY)?;
 
         // add inode to map
-        self.set_inode_path(attrs.ino, parent_path, name)?;
+        self.icache().set_inode_path(attrs.ino, parent_path, name)?;
 
         Ok((attrs, fh as u64))
     }
@@ -678,7 +572,7 @@ impl ZstdFS {
         _mode: u32,
         _umask: u32,
     ) -> Result<FileAttr, libc::c_int> {
-        let parent_path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
+        let parent_path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
         let path = parent_path.join(name);
         fs::create_dir(&path).map_err(convert_io_error)?;
         let metadata = fs::metadata(path).map_err(convert_io_error)?;
@@ -689,32 +583,33 @@ impl ZstdFS {
         access_all(&mut attrs);
 
         // update inode map
-        self.set_inode_path(attrs.ino, parent_path, name.to_string_lossy())?;
+        self.icache()
+            .set_inode_path(attrs.ino, parent_path, name.to_string_lossy())?;
 
         Ok(attrs)
     }
 
     fn unlink_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<(), libc::c_int> {
-        let parent_path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
+        let parent_path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
         let path = parent_path.join(name.to_string_lossy().to_string() + ".zst");
         let ino = fs::metadata(&path).map_err(convert_io_error)?.st_ino();
         fs::remove_file(path).map_err(convert_io_error)?;
         if self.convert {
             // removing e.g. file which hasn't been converted yet
-            let _ = self.del_inode_path(ino);
+            let _ = self.icache().del_inode_path(ino);
         } else {
-            self.del_inode_path(ino)?;
+            self.icache().del_inode_path(ino)?;
         }
         self.opened_files.unlink(ino);
         Ok(())
     }
 
     fn rmdir_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<(), libc::c_int> {
-        let parent_path = Path::new(&self.get_inode_path(parent)?).to_path_buf();
+        let parent_path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
         let path = parent_path.join(name.to_string_lossy().to_string());
         let ino = fs::metadata(&path).map_err(convert_io_error)?.st_ino();
         fs::remove_dir(path).map_err(convert_io_error)?;
-        self.del_inode_path(ino)?;
+        self.icache().del_inode_path(ino)?;
         Ok(())
     }
 
@@ -745,19 +640,19 @@ impl ZstdFS {
             }
         };
 
-        let from_path = Path::new(&self.get_inode_path(parent)?)
+        let from_path = Path::new(&self.icache().get_inode_path(parent)?)
             .to_path_buf()
             .join(name);
 
-        let to_parent_path = Path::new(&self.get_inode_path(newparent)?).to_path_buf();
+        let to_parent_path = Path::new(&self.icache().get_inode_path(newparent)?).to_path_buf();
         let to_path = to_parent_path.join(&newname);
 
-        let orig_ino = fs::metadata(&to_path).ok().map(|e| e.st_ino());
+        let _orig_ino = fs::metadata(&to_path).ok().map(|e| e.st_ino());
 
         fs::rename(from_path, &to_path).map_err(convert_io_error)?;
 
         // Update inode mapping
-        self.set_inode_path(ino, to_parent_path, newname)?;
+        self.icache().set_inode_path(ino, to_parent_path, newname)?;
 
         Ok(())
     }
@@ -781,12 +676,9 @@ impl Filesystem for ZstdFS {
     ) -> Result<(), libc::c_int> {
         fs::create_dir_all(Path::new(&self.tree_dir())).map_err(convert_io_error)?;
 
-        #[cfg(feature = "with_disk_inode_cache")]
-        let inode_db = sled::open(self.inode_dir()).map_err(convert_sled_error)?;
-        #[cfg(not(feature = "with_disk_inode_cache"))]
-        let inode_db = LruCache::with_capacity(MAX_CACHE_SIZE);
-        self.inode_db = Some(inode_db);
-        self.set_inode_path(FUSE_ROOT_ID, self.tree_dir(), "")?;
+        self.inode_cache = Some(cache::InodeCache::new()?);
+        let path = self.tree_dir().to_owned();
+        self.icache().set_inode_path(FUSE_ROOT_ID, path, "")?;
 
         Ok(())
     }
@@ -800,7 +692,7 @@ impl Filesystem for ZstdFS {
         match self.lookup_wrapper(parent, name) {
             Ok(attrs) => {
                 debug!("Lookup OK (inode={})", attrs.ino);
-                reply.entry(&TTL, &attrs, 0);
+                reply.entry(&cache::TTL, &attrs, 0);
             }
             Err(err) => {
                 debug!("Lookup Err (code={})", err);
@@ -814,7 +706,7 @@ impl Filesystem for ZstdFS {
         match self.getattr_wrapper(ino) {
             Ok(attrs) => {
                 debug!("getattr ok");
-                reply.attr(&TTL, &attrs);
+                reply.attr(&cache::TTL, &attrs);
             }
             Err(err) => {
                 debug!("getattr error({})", err);
@@ -850,7 +742,7 @@ impl Filesystem for ZstdFS {
         ) {
             Ok(attrs) => {
                 debug!("setattr ok");
-                reply.attr(&TTL, &attrs);
+                reply.attr(&cache::TTL, &attrs);
             }
             Err(err) => {
                 debug!("setattr error({})", err);
@@ -963,7 +855,7 @@ impl Filesystem for ZstdFS {
         match self.create_wrapper(parent, name, mode, umask, flags) {
             Ok((attrs, fh)) => {
                 debug!("created (inode={}, fh={})", attrs.ino, fh);
-                reply.created(&TTL, &attrs, 0, fh, flags as u32);
+                reply.created(&cache::TTL, &attrs, 0, fh, flags as u32);
             }
             Err(err) => {
                 debug!("create failed (err={})", err);
@@ -1015,7 +907,7 @@ impl Filesystem for ZstdFS {
         match self.mkdir_wrapper(parent, name, mode, umask) {
             Ok(attrs) => {
                 debug!("mkdir passed (ino={})", attrs.ino);
-                reply.entry(&TTL, &attrs, 0);
+                reply.entry(&cache::TTL, &attrs, 0);
             }
             Err(err) => {
                 debug!("mkdir failed (err={})", err);
@@ -1121,10 +1013,6 @@ impl Filesystem for ZstdFS {
                 reply.error(err);
             }
         }
-    }
-
-    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        debug!("forget {ino}");
     }
 }
 
