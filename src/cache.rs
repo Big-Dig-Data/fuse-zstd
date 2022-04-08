@@ -158,7 +158,7 @@ impl InodeCache {
 
             Ok(if let Some(data) = self.inode_db.get(&ino.data_dir_key()) {
                 // Updating records
-                let (dd_ino, mp_ino, _) = Self::extract_data(data);
+                let (mp_ino, dd_ino, _) = Self::extract_data(data);
 
                 // Delete related records
                 self.del_inode_path(Inode::new_mp(mp_ino));
@@ -198,6 +198,10 @@ impl InodeCache {
             .inode_db
             .get(&Inode::new_mp(mount_point_inode).mount_point_key())?;
         let (_, dd_ino, _) = Self::extract_data(data);
+
+        // Hit cache for both parts
+        let _ = self.get_inode_path(Inode::new(Some(mount_point_inode), Some(dd_ino)));
+
         Some(dd_ino)
     }
 }

@@ -347,7 +347,7 @@ impl ZstdFS {
             return Err(libc::ENOTDIR);
         }
 
-        let entries = fs::read_dir(file_path).map_err(convert_io_error)?;
+        let entries = fs::read_dir(&file_path).map_err(convert_io_error)?;
 
         for (i, entry) in entries.skip(offset as usize).enumerate() {
             let entry = entry.map_err(convert_io_error)?;
@@ -377,14 +377,19 @@ impl ZstdFS {
                 }
             };
 
+            // Refresh caches
+            let entry_ino =
+                self.icache()
+                    .set_inode_path(Inode::new_dd(entry.ino()), &file_path, &file_name)?;
+
             debug!(
                 "Entry {}, {}, {:?}, {:?}",
-                entry.ino(),
+                entry_ino,
                 offset + i as i64 + 1,
                 &file_type,
                 &file_name,
             );
-            if reply.add(entry.ino(), offset + i as i64 + 1, file_type, file_name) {
+            if reply.add(entry_ino, offset + i as i64 + 1, file_type, file_name) {
                 break;
             }
         }
@@ -506,11 +511,14 @@ impl ZstdFS {
 
     fn read_wrapper(
         &mut self,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
     ) -> Result<Vec<u8>, libc::c_int> {
+        // Hit the cache
+        let _ = self.get_path(Inode::new_mp(ino));
+
         let file_handler = self.opened_files.get_mut(fh).ok_or(libc::ENOENT)?;
         let mut res = vec![0; size as usize];
         let read_size = file_handler
@@ -567,7 +575,7 @@ impl ZstdFS {
     #[allow(clippy::too_many_arguments)]
     fn write_wrapper(
         &mut self,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -575,6 +583,9 @@ impl ZstdFS {
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<usize, libc::c_int> {
+        // Hit the cache
+        let _ = self.get_path(Inode::new_mp(ino));
+
         let mut file_handler = self.opened_files.get_mut(fh).ok_or(libc::EBADF)?;
 
         // File should be synced to source dir
