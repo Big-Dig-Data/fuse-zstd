@@ -2,18 +2,22 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io,
+    path::PathBuf,
 };
 
+#[derive(Debug)]
 pub struct OpenedFiles {
     inode_mapping: HashMap<u64, HashSet<u64>>,
     handlers: HashMap<u64, FileHandler>,
 }
 
+#[derive(Debug)]
 pub struct FileHandler {
     pub flags: i32,
     pub needs_sync: bool,
     pub file: File,
     pub ino: Option<u64>,
+    pub path: Option<PathBuf>,
 }
 
 impl OpenedFiles {
@@ -48,7 +52,7 @@ impl OpenedFiles {
         Some(len)
     }
 
-    pub fn insert(&mut self, ino: u64, flags: i32, file: File) -> Option<u64> {
+    pub fn insert(&mut self, ino: u64, flags: i32, file: File, path: PathBuf) -> Option<u64> {
         let new_fh = self.new_fh_number()?;
 
         let _ = self.handlers.insert(
@@ -58,6 +62,7 @@ impl OpenedFiles {
                 flags,
                 needs_sync: false,
                 ino: Some(ino),
+                path: Some(path),
             },
         );
         self.inode_mapping
@@ -90,6 +95,7 @@ impl OpenedFiles {
             needs_sync: false,
             file: new_file,
             ino: Some(ino),
+            path: handler.path.clone(),
         };
         let _ = self.handlers.insert(new_fh, new_handler);
         Ok(Some(new_fh))
@@ -113,9 +119,10 @@ impl OpenedFiles {
     pub fn unlink(&mut self, ino: u64) -> Option<HashSet<u64>> {
         let handlers = self.inode_mapping.remove(&ino)?;
         // Set ino to None in handlers
-        handlers
-            .iter()
-            .for_each(|fh| self.handlers.get_mut(fh).unwrap().ino = None);
+        handlers.iter().for_each(|fh| {
+            self.handlers.get_mut(fh).unwrap().ino = None;
+            self.handlers.get_mut(fh).unwrap().path = None;
+        });
         Some(handlers)
     }
 

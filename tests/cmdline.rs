@@ -119,6 +119,7 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
     let mp = populated_mounted_fs.mount_point();
     let dd = populated_mounted_fs.data_dir();
 
+    /*
     // new file
     Command::new("tee")
         .arg(&mp.join("first/second/file-new.txt"))
@@ -134,6 +135,9 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
 
     let zfile = dd.join("first/second/file-new.txt.zst");
     assert_eq!(utils::get_compressed_content(zfile), "new file content");
+    */
+
+    dbg!("OVERRR1");
 
     // truncate
     Command::new("tee")
@@ -147,6 +151,8 @@ fn tee(populated_mounted_fs: utils::FuseZstdProcess) {
         fs::read_to_string(&mp.join("first/file1.txt")).unwrap(),
         "truncated"
     );
+
+    dbg!("OVERRR");
 
     let zfile = dd.join("first/file1.txt.zst");
     assert_eq!(utils::get_compressed_content(zfile), "truncated");

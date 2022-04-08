@@ -1,3 +1,7 @@
+mod cache;
+mod file;
+mod inode;
+
 use clap::{crate_authors, crate_name, crate_version, App, Arg};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
@@ -17,8 +21,7 @@ use std::{
 };
 use xattr::FileExt as XattrFileExt;
 
-mod cache;
-mod file;
+use crate::inode::Inode;
 
 struct FileAttrWrapper {
     file_attr: FileAttr,
@@ -186,13 +189,22 @@ impl ZstdFS {
         self.inode_cache.as_mut().unwrap()
     }
 
+    fn get_path(&mut self, ino: Inode) -> Result<PathBuf, libc::c_int> {
+        if ino.mount_point_inode == FUSE_ROOT_ID {
+            Ok(self.tree_dir().clone())
+        } else {
+            Ok(Path::new(&self.icache().get_inode_path(ino)?).to_path_buf())
+        }
+    }
+
     fn sync_to_fs(&mut self, fh: u64, close: bool, force_sync: bool) -> Result<(), libc::c_int> {
-        let (ino, needs_sync, file) = if close {
+        let (ino, needs_sync, file, path) = if close {
             let fh = self.opened_files.close(fh).ok_or(libc::EBADF)?;
             (
                 fh.ino,
                 fh.needs_sync,
                 fh.file.try_clone().map_err(convert_io_error)?,
+                fh.path,
             )
         } else {
             let fh = self.opened_files.get(fh).ok_or(libc::ENOENT)?;
@@ -200,12 +212,13 @@ impl ZstdFS {
                 fh.ino,
                 fh.needs_sync,
                 fh.file.try_clone().map_err(convert_io_error)?,
+                fh.path.clone(),
             )
         };
 
         if needs_sync || force_sync {
             if let Some(ino) = ino {
-                let source_path = Path::new(&self.icache().get_inode_path(ino)?).to_path_buf();
+                let source_path = path.unwrap();
                 let dir_path = source_path.parent().unwrap().to_path_buf();
 
                 let (source_file, _) = store_to_source_file(
@@ -223,9 +236,11 @@ impl ZstdFS {
                 // also keep the original inode -> path mapping
                 // so that it can be used for further querying
                 debug!("New inode {}", metadata.st_ino());
+
+                // Updating old ino to new ino
                 self.opened_files.update_ino(ino, metadata.st_ino());
                 self.icache()
-                    .set_inode_path(metadata.st_ino(), source_path, "")?;
+                    .set_inode_path(Inode::new_dd(metadata.st_ino()), source_path, "")?;
 
                 // update needs_update because the file was synced
                 if !close {
@@ -240,7 +255,7 @@ impl ZstdFS {
     }
 
     fn lookup_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, libc::c_int> {
-        let path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
+        let path = self.get_path(Inode::new_mp(parent))?;
         let entries = fs::read_dir(&path).map_err(convert_io_error)?;
         let name = name.to_string_lossy().to_string();
         for entry in entries {
@@ -253,8 +268,9 @@ impl ZstdFS {
                 name.clone()
             };
             if entry.file_name().to_string_lossy() == filename {
-                self.icache()
-                    .set_inode_path(entry.ino(), &path, &filename)?;
+                let ino =
+                    self.icache()
+                        .set_inode_path(Inode::new_dd(entry.ino()), &path, &filename)?;
                 let mut faw = FileAttrWrapper::try_from(entry).map_err(convert_io_error)?;
                 // Update size from extended attributes
                 let file = fs::File::open(path.join(filename)).map_err(convert_io_error)?;
@@ -268,6 +284,9 @@ impl ZstdFS {
                 if self.convert && attrs.kind == FileType::RegularFile {
                     let _ = fs::remove_file(path.join(&name));
                 }
+
+                // Update ino mp inodes
+                attrs.ino = ino;
 
                 return Ok(attrs);
             }
@@ -303,7 +322,10 @@ impl ZstdFS {
                     // allow access to all
                     access_all(&mut attrs);
 
-                    self.icache().set_inode_path(attrs.ino, path, zname)?;
+                    let ino =
+                        self.icache()
+                            .set_inode_path(Inode::new_dd(attrs.ino), path, zname)?;
+                    attrs.ino = ino;
 
                     return Ok(attrs);
                 }
@@ -319,7 +341,7 @@ impl ZstdFS {
         offset: i64,
         reply: &mut ReplyDirectory,
     ) -> Result<(), libc::c_int> {
-        let file_path = self.icache().get_inode_path(ino)?;
+        let file_path = self.get_path(Inode::new_mp(ino))?;
         let metadata = fs::metadata(&file_path).map_err(convert_io_error)?;
         if !metadata.is_dir() {
             return Err(libc::ENOTDIR);
@@ -370,7 +392,7 @@ impl ZstdFS {
     }
 
     fn getattr_wrapper(&mut self, ino: u64) -> Result<FileAttr, libc::c_int> {
-        let file_path = self.icache().get_inode_path(ino)?;
+        let file_path = self.get_path(Inode::new_mp(ino))?;
         let file = fs::File::open(file_path).map_err(convert_io_error)?;
         let metadata = file.metadata().map_err(convert_io_error)?;
         let mut faw: FileAttrWrapper = metadata.try_into().map_err(convert_io_error)?;
@@ -380,6 +402,9 @@ impl ZstdFS {
 
         // Allow access to all
         access_all(&mut attrs);
+
+        // override to mp ino
+        attrs.ino = ino;
 
         Ok(attrs)
     }
@@ -410,7 +435,9 @@ impl ZstdFS {
                     file_handler.file.set_len(size).map_err(convert_io_error)?;
                 }
             }
-            if let Some(fhs) = self.opened_files.get_fhs(ino) {
+
+            let dd_ino = self.icache().get_data_dir_inode(ino).ok_or(libc::ENOENT)?;
+            if let Some(fhs) = self.opened_files.get_fhs(dd_ino) {
                 fhs.to_owned()
                     .into_iter()
                     .filter_map(|fh| {
@@ -428,17 +455,20 @@ impl ZstdFS {
     }
 
     fn open_wrapper(&mut self, ino: u64, flags: i32) -> Result<u64, libc::c_int> {
+        let file_path = self.get_path(Inode::new_mp(ino))?;
+        let dd_ino = fs::metadata(&file_path).map_err(convert_io_error)?.st_ino();
+
         // Already opened by some other process
         if let Some(fh) = self
             .opened_files
-            .duplicate(ino, flags)
+            .duplicate(dd_ino, flags)
             .map_err(convert_io_error)?
         {
             return Ok(fh);
         }
 
-        let file_path = self.icache().get_inode_path(ino)?;
-        let source_file = fs::File::open(file_path).map_err(convert_io_error)?;
+        let file_path = self.get_path(Inode::new_mp(ino))?;
+        let source_file = fs::File::open(&file_path).map_err(convert_io_error)?;
         let mut target_file = tempfile::tempfile().map_err(convert_io_error)?;
         zstd::stream::copy_decode(
             source_file.try_clone().map_err(convert_io_error)?,
@@ -463,10 +493,12 @@ impl ZstdFS {
         // Make sure that new size is written to original directory
         source_file.sync_all().map_err(convert_io_error)?;
 
+        let dd_ino = self.icache().get_data_dir_inode(ino).unwrap();
+
         // Store info about newly opened file
         let fh = self
             .opened_files
-            .insert(ino, flags, target_file)
+            .insert(dd_ino, flags, target_file, file_path)
             .ok_or(libc::EBUSY)?;
 
         Ok(fh)
@@ -499,7 +531,7 @@ impl ZstdFS {
     ) -> Result<(FileAttr, u64), libc::c_int> {
         // Create emtpy file in the tree dir
         let name = name.to_string_lossy().to_string() + ".zst";
-        let parent_path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
+        let parent_path = self.get_path(Inode::new_mp(parent))?;
 
         let opened_file = tempfile::tempfile().map_err(convert_io_error)?;
 
@@ -519,11 +551,15 @@ impl ZstdFS {
         // New file handler
         let fh = self
             .opened_files
-            .insert(attrs.ino, flags, opened_file)
+            .insert(attrs.ino, flags, opened_file, parent_path.join(&name))
             .ok_or(libc::EBUSY)?;
 
         // add inode to map
-        self.icache().set_inode_path(attrs.ino, parent_path, name)?;
+        let ino = self
+            .icache()
+            .set_inode_path(Inode::new_dd(attrs.ino), parent_path, name)?;
+
+        attrs.ino = ino;
 
         Ok((attrs, fh as u64))
     }
@@ -576,7 +612,7 @@ impl ZstdFS {
         _mode: u32,
         _umask: u32,
     ) -> Result<FileAttr, libc::c_int> {
-        let parent_path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
+        let parent_path = self.get_path(Inode::new_mp(parent))?;
         let path = parent_path.join(name);
         fs::create_dir(&path).map_err(convert_io_error)?;
         let metadata = fs::metadata(path).map_err(convert_io_error)?;
@@ -587,33 +623,34 @@ impl ZstdFS {
         access_all(&mut attrs);
 
         // update inode map
-        self.icache()
-            .set_inode_path(attrs.ino, parent_path, name.to_string_lossy())?;
+        let ino = self.icache().set_inode_path(
+            Inode::new_dd(attrs.ino),
+            parent_path,
+            name.to_string_lossy(),
+        )?;
+
+        attrs.ino = ino;
 
         Ok(attrs)
     }
 
     fn unlink_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<(), libc::c_int> {
-        let parent_path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
+        let parent_path = self.get_path(Inode::new_mp(parent))?;
         let path = parent_path.join(name.to_string_lossy().to_string() + ".zst");
         let ino = fs::metadata(&path).map_err(convert_io_error)?.st_ino();
         fs::remove_file(path).map_err(convert_io_error)?;
-        if self.convert {
-            // removing e.g. file which hasn't been converted yet
-            let _ = self.icache().del_inode_path(ino);
-        } else {
-            self.icache().del_inode_path(ino)?;
-        }
+        self.icache().del_inode_path(Inode::new_dd(ino));
+        // TODO how to unlink expired files
         self.opened_files.unlink(ino);
         Ok(())
     }
 
     fn rmdir_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<(), libc::c_int> {
-        let parent_path = Path::new(&self.icache().get_inode_path(parent)?).to_path_buf();
+        let parent_path = self.get_path(Inode::new_mp(parent))?;
         let path = parent_path.join(name.to_string_lossy().to_string());
         let ino = fs::metadata(&path).map_err(convert_io_error)?.st_ino();
         fs::remove_dir(path).map_err(convert_io_error)?;
-        self.icache().del_inode_path(ino)?;
+        self.icache().del_inode_path(Inode::new_dd(ino));
         Ok(())
     }
 
@@ -644,19 +681,29 @@ impl ZstdFS {
             }
         };
 
-        let from_path = Path::new(&self.icache().get_inode_path(parent)?)
-            .to_path_buf()
-            .join(name);
+        let from_path = self.get_path(Inode::new_mp(parent))?.join(name);
 
-        let to_parent_path = Path::new(&self.icache().get_inode_path(newparent)?).to_path_buf();
+        let to_parent_path = self.get_path(Inode::new_mp(newparent))?;
         let to_path = to_parent_path.join(&newname);
 
-        let _orig_ino = fs::metadata(&to_path).ok().map(|e| e.st_ino());
+        if let Some(orig_ino) = fs::metadata(&to_path).ok().map(|e| e.st_ino()) {
+            self.icache().del_inode_path(Inode::new_dd(orig_ino));
+            self.opened_files.unlink(orig_ino);
+        }
 
         fs::rename(from_path, &to_path).map_err(convert_io_error)?;
 
+        let new_ino = fs::metadata(&to_path).unwrap().st_ino();
+
         // Update inode mapping
-        self.icache().set_inode_path(ino, to_parent_path, newname)?;
+        self.icache().set_inode_path(
+            Inode::new(Some(ino), Some(new_ino)),
+            to_parent_path,
+            newname,
+        )?;
+
+        // TODO update opened files to match path
+        // without update the opened files will be written to old location
 
         Ok(())
     }
@@ -681,8 +728,6 @@ impl Filesystem for ZstdFS {
         fs::create_dir_all(Path::new(&self.tree_dir())).map_err(convert_io_error)?;
 
         self.inode_cache = Some(cache::InodeCache::new()?);
-        let path = self.tree_dir().to_owned();
-        self.icache().set_inode_path(FUSE_ROOT_ID, path, "")?;
 
         Ok(())
     }
