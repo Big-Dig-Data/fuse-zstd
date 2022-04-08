@@ -5,10 +5,19 @@ use std::{
     path::PathBuf,
 };
 
+use crate::Inode;
+
 #[derive(Debug)]
 pub struct OpenedFiles {
-    inode_mapping: HashMap<u64, HashSet<u64>>,
+    data_dir_inode_mapping: HashMap<u64, HashSet<u64>>,
+    mount_point_inode_mapping: HashMap<u64, HashSet<u64>>,
     handlers: HashMap<u64, FileHandler>,
+}
+
+#[derive(Debug, Clone)]
+pub struct References {
+    pub inode: Inode,
+    pub path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -16,14 +25,14 @@ pub struct FileHandler {
     pub flags: i32,
     pub needs_sync: bool,
     pub file: File,
-    pub ino: Option<u64>,
-    pub path: Option<PathBuf>,
+    pub refs: Option<References>,
 }
 
 impl OpenedFiles {
     pub fn new() -> Self {
         Self {
-            inode_mapping: HashMap::new(),
+            data_dir_inode_mapping: HashMap::new(),
+            mount_point_inode_mapping: HashMap::new(),
             handlers: HashMap::new(),
         }
     }
@@ -38,13 +47,20 @@ impl OpenedFiles {
     }
 
     pub fn update_ino(&mut self, old_ino: u64, new_ino: u64) -> Option<usize> {
-        let fhs = self.inode_mapping.remove(&old_ino)?;
+        let fhs = self.data_dir_inode_mapping.remove(&old_ino)?;
         let len = fhs.len();
         for fh in &fhs {
             let handler = self.handlers.get_mut(fh).unwrap();
-            handler.ino = Some(new_ino);
+            if let Some(mut refs) = handler.refs.as_mut() {
+                refs.inode.data_dir_inode = new_ino;
+            }
         }
-        self.inode_mapping
+        self.data_dir_inode_mapping
+            .entry(new_ino)
+            .or_insert_with(HashSet::new)
+            .extend(fhs.clone());
+
+        self.mount_point_inode_mapping
             .entry(new_ino)
             .or_insert_with(HashSet::new)
             .extend(fhs);
@@ -52,7 +68,7 @@ impl OpenedFiles {
         Some(len)
     }
 
-    pub fn insert(&mut self, ino: u64, flags: i32, file: File, path: PathBuf) -> Option<u64> {
+    pub fn insert(&mut self, inode: Inode, flags: i32, file: File, path: PathBuf) -> Option<u64> {
         let new_fh = self.new_fh_number()?;
 
         let _ = self.handlers.insert(
@@ -61,12 +77,16 @@ impl OpenedFiles {
                 file,
                 flags,
                 needs_sync: false,
-                ino: Some(ino),
-                path: Some(path),
+                refs: Some(References { inode, path }),
             },
         );
-        self.inode_mapping
-            .entry(ino)
+        self.data_dir_inode_mapping
+            .entry(inode.data_dir_inode)
+            .or_insert_with(HashSet::new)
+            .insert(new_fh);
+
+        self.mount_point_inode_mapping
+            .entry(inode.mount_point_inode)
             .or_insert_with(HashSet::new)
             .insert(new_fh);
 
@@ -74,7 +94,7 @@ impl OpenedFiles {
     }
 
     pub fn duplicate(&mut self, ino: u64, flags: i32) -> io::Result<Option<u64>> {
-        let mapping = if let Some(mapping) = self.inode_mapping.get(&ino) {
+        let mapping = if let Some(mapping) = self.data_dir_inode_mapping.get(&ino) {
             mapping
         } else {
             return Ok(None);
@@ -94,8 +114,7 @@ impl OpenedFiles {
             flags,
             needs_sync: false,
             file: new_file,
-            ino: Some(ino),
-            path: handler.path.clone(),
+            refs: handler.refs.clone(),
         };
         let _ = self.handlers.insert(new_fh, new_handler);
         Ok(Some(new_fh))
@@ -103,10 +122,23 @@ impl OpenedFiles {
 
     pub fn close(&mut self, fh: u64) -> Option<FileHandler> {
         if let Some(handler) = self.handlers.remove(&fh) {
-            if let Some(ino) = handler.ino {
-                if let Some(mut mapping) = self.inode_mapping.remove(&ino) {
+            if let Some(refs) = handler.refs.as_ref() {
+                if let Some(mut mapping) = self
+                    .data_dir_inode_mapping
+                    .remove(&refs.inode.data_dir_inode)
+                {
                     if mapping.remove(&fh) && !mapping.is_empty() {
-                        self.inode_mapping.insert(ino, mapping);
+                        self.data_dir_inode_mapping
+                            .insert(refs.inode.data_dir_inode, mapping);
+                    }
+                }
+                if let Some(mut mapping) = self
+                    .mount_point_inode_mapping
+                    .remove(&refs.inode.mount_point_inode)
+                {
+                    if mapping.remove(&fh) && !mapping.is_empty() {
+                        self.mount_point_inode_mapping
+                            .insert(refs.inode.mount_point_inode, mapping);
                     }
                 }
             }
@@ -117,11 +149,15 @@ impl OpenedFiles {
     }
 
     pub fn unlink(&mut self, ino: u64) -> Option<HashSet<u64>> {
-        let handlers = self.inode_mapping.remove(&ino)?;
-        // Set ino to None in handlers
+        let handlers = self.data_dir_inode_mapping.remove(&ino)?;
+        // Clear refs
         handlers.iter().for_each(|fh| {
-            self.handlers.get_mut(fh).unwrap().ino = None;
-            self.handlers.get_mut(fh).unwrap().path = None;
+            let handler = self.handlers.get_mut(fh).unwrap();
+            let _ = self
+                .mount_point_inode_mapping
+                .remove(&handler.refs.as_ref().unwrap().inode.mount_point_inode);
+            handler.refs = None;
+            self.handlers.get_mut(fh).unwrap().refs = None;
         });
         Some(handlers)
     }
@@ -134,7 +170,11 @@ impl OpenedFiles {
         self.handlers.get_mut(&fh)
     }
 
-    pub fn get_fhs(&self, ino: u64) -> Option<&HashSet<u64>> {
-        self.inode_mapping.get(&ino)
+    pub fn get_fhs_from_data_dir_inode(&self, ino: u64) -> Option<&HashSet<u64>> {
+        self.data_dir_inode_mapping.get(&ino)
+    }
+
+    pub fn get_fhs_from_mount_point_inode(&self, ino: u64) -> Option<&HashSet<u64>> {
+        self.mount_point_inode_mapping.get(&ino)
     }
 }

@@ -1,5 +1,5 @@
 use rstest::*;
-use std::{fs, io::Write, mem, os::linux::fs::MetadataExt, path};
+use std::{fs, io::Write, mem, os::linux::fs::MetadataExt, path, thread::sleep, time::Duration};
 
 #[path = "utils.rs"]
 pub mod utils;
@@ -228,7 +228,8 @@ fn flush(#[case] mounted_fs: utils::FuseZstdProcess) {
     assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "ORIGINAL");
 
     // closing cloned fd should trigger flush
-    file.try_clone().unwrap();
+    let cloned_file = file.try_clone().unwrap();
+    mem::drop(cloned_file);
 
     assert_ne!(
         original_ino,
@@ -239,7 +240,7 @@ fn flush(#[case] mounted_fs: utils::FuseZstdProcess) {
 }
 
 #[rstest]
-//#[case::no_convert(mounted_fs_no_convert())]
+#[case::no_convert(mounted_fs_no_convert())]
 #[case::convert(mounted_fs_convert())]
 fn too_close_write_and_lookup(#[case] mounted_fs: utils::FuseZstdProcess) {
     let mp = mounted_fs.mount_point();
@@ -263,4 +264,30 @@ fn too_close_write_and_lookup(#[case] mounted_fs: utils::FuseZstdProcess) {
     file1.write(b"2 CLOSE").unwrap();
     mem::drop(file1);
     assert_eq!(fs::read_to_string(mp.join("file2.txt")).unwrap(), "2 CLOSE");
+}
+
+#[rstest]
+#[case::no_convert(mounted_fs_no_convert())]
+fn using_opened_fh_when_cache_fails(#[case] mounted_fs: utils::FuseZstdProcess) {
+    let mp = mounted_fs.mount_point();
+
+    // Create and leave file opened
+    let mut file1 = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(mp.join("file.txt"))
+        .unwrap();
+    file1.write(b"FH cache 1").unwrap();
+
+    // Wait till the cache expires
+    sleep(Duration::from_millis(2500)); // 2.5 seconds should be enough
+
+    assert!(file1.metadata().is_ok());
+
+    // Removing the file should make impossible to reach the file
+    fs::remove_file(mp.join("file.txt")).unwrap();
+
+    sleep(Duration::from_millis(2500)); // 2.5 seconds should be enough
+
+    assert!(file1.metadata().is_err());
 }

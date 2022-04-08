@@ -193,32 +193,91 @@ impl ZstdFS {
         if ino.mount_point_inode == FUSE_ROOT_ID {
             Ok(self.tree_dir().clone())
         } else {
-            Ok(Path::new(&self.icache().get_inode_path(ino)?).to_path_buf())
+            if let Ok(path) = self.icache().get_inode_path(ino) {
+                return Ok(Path::new(&path).to_path_buf());
+            }
+
+            // Try to search through opened file descriptios
+            if let Some(fhs) = self
+                .opened_files
+                .get_fhs_from_data_dir_inode(ino.data_dir_inode)
+                .map(|e| e.to_owned())
+            {
+                for fh in fhs {
+                    if let Some(handler) = self.opened_files.get(fh) {
+                        if let Some(refs) = handler.refs.as_ref() {
+                            return Ok(refs.path.clone());
+                        }
+                    }
+                }
+            }
+
+            if let Some(fhs) = self
+                .opened_files
+                .get_fhs_from_mount_point_inode(ino.mount_point_inode)
+                .map(|e| e.to_owned())
+            {
+                for fh in fhs {
+                    if let Some(handler) = self.opened_files.get(fh) {
+                        if let Some(refs) = handler.refs.as_ref() {
+                            return Ok(refs.path.clone());
+                        }
+                    }
+                }
+            }
+
+            Err(libc::ENOENT)
+        }
+    }
+
+    fn get_data_dir_inode(&mut self, mount_point_inode: u64) -> Result<u64, libc::c_int> {
+        if mount_point_inode == FUSE_ROOT_ID {
+            Ok(fs::metadata(&self.tree_dir)
+                .map_err(convert_io_error)?
+                .st_ino())
+        } else {
+            if let Some(ino) = self.icache().get_data_dir_inode(mount_point_inode) {
+                Ok(ino)
+            } else {
+                if let Some(fhs) = self
+                    .opened_files
+                    .get_fhs_from_mount_point_inode(mount_point_inode)
+                    .map(|e| e.to_owned())
+                {
+                    for fh in fhs {
+                        if let Some(handler) = self.opened_files.get(fh) {
+                            if let Some(refs) = handler.refs.as_ref() {
+                                return Ok(refs.inode.data_dir_inode);
+                            }
+                        }
+                    }
+                }
+
+                Err(libc::ENOENT)
+            }
         }
     }
 
     fn sync_to_fs(&mut self, fh: u64, close: bool, force_sync: bool) -> Result<(), libc::c_int> {
-        let (ino, needs_sync, file, path) = if close {
+        let (refs, needs_sync, file) = if close {
             let fh = self.opened_files.close(fh).ok_or(libc::EBADF)?;
             (
-                fh.ino,
+                fh.refs.clone(),
                 fh.needs_sync,
                 fh.file.try_clone().map_err(convert_io_error)?,
-                fh.path,
             )
         } else {
             let fh = self.opened_files.get(fh).ok_or(libc::ENOENT)?;
             (
-                fh.ino,
+                fh.refs.clone(),
                 fh.needs_sync,
                 fh.file.try_clone().map_err(convert_io_error)?,
-                fh.path.clone(),
             )
         };
 
         if needs_sync || force_sync {
-            if let Some(ino) = ino {
-                let source_path = path.unwrap();
+            if let Some(refs) = refs {
+                let source_path = refs.path;
                 let dir_path = source_path.parent().unwrap().to_path_buf();
 
                 let (source_file, _) = store_to_source_file(
@@ -238,7 +297,8 @@ impl ZstdFS {
                 debug!("New inode {}", metadata.st_ino());
 
                 // Updating old ino to new ino
-                self.opened_files.update_ino(ino, metadata.st_ino());
+                self.opened_files
+                    .update_ino(refs.inode.data_dir_inode, metadata.st_ino());
                 self.icache()
                     .set_inode_path(Inode::new_dd(metadata.st_ino()), source_path, "")?;
 
@@ -441,8 +501,7 @@ impl ZstdFS {
                 }
             }
 
-            let dd_ino = self.icache().get_data_dir_inode(ino).ok_or(libc::ENOENT)?;
-            if let Some(fhs) = self.opened_files.get_fhs(dd_ino) {
+            if let Some(fhs) = self.opened_files.get_fhs_from_mount_point_inode(ino) {
                 fhs.to_owned()
                     .into_iter()
                     .filter_map(|fh| {
@@ -460,8 +519,7 @@ impl ZstdFS {
     }
 
     fn open_wrapper(&mut self, ino: u64, flags: i32) -> Result<u64, libc::c_int> {
-        let file_path = self.get_path(Inode::new_mp(ino))?;
-        let dd_ino = fs::metadata(&file_path).map_err(convert_io_error)?.st_ino();
+        let dd_ino = self.get_data_dir_inode(ino)?;
 
         // Already opened by some other process
         if let Some(fh) = self
@@ -498,12 +556,15 @@ impl ZstdFS {
         // Make sure that new size is written to original directory
         source_file.sync_all().map_err(convert_io_error)?;
 
-        let dd_ino = self.icache().get_data_dir_inode(ino).unwrap();
-
         // Store info about newly opened file
         let fh = self
             .opened_files
-            .insert(dd_ino, flags, target_file, file_path)
+            .insert(
+                Inode::new(Some(ino), Some(dd_ino)),
+                flags,
+                target_file,
+                file_path,
+            )
             .ok_or(libc::EBUSY)?;
 
         Ok(fh)
@@ -556,16 +617,21 @@ impl ZstdFS {
         // allow access to all
         access_all(&mut attrs);
 
-        // New file handler
-        let fh = self
-            .opened_files
-            .insert(attrs.ino, flags, opened_file, parent_path.join(&name))
-            .ok_or(libc::EBUSY)?;
-
         // add inode to map
         let ino = self
             .icache()
-            .set_inode_path(Inode::new_dd(attrs.ino), parent_path, name)?;
+            .set_inode_path(Inode::new_dd(attrs.ino), &parent_path, &name)?;
+
+        // New file handler
+        let fh = self
+            .opened_files
+            .insert(
+                Inode::new(Some(ino), Some(attrs.ino)),
+                flags,
+                opened_file,
+                parent_path.join(&name),
+            )
+            .ok_or(libc::EBUSY)?;
 
         attrs.ino = ino;
 
