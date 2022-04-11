@@ -60,11 +60,6 @@ impl OpenedFiles {
             .or_insert_with(HashSet::new)
             .extend(fhs.clone());
 
-        self.mount_point_inode_mapping
-            .entry(new_ino)
-            .or_insert_with(HashSet::new)
-            .extend(fhs);
-
         Some(len)
     }
 
@@ -93,8 +88,9 @@ impl OpenedFiles {
         Some(new_fh)
     }
 
-    pub fn duplicate(&mut self, ino: u64, flags: i32) -> io::Result<Option<u64>> {
-        let mapping = if let Some(mapping) = self.data_dir_inode_mapping.get(&ino) {
+    pub fn duplicate(&mut self, inode: Inode, flags: i32) -> io::Result<Option<u64>> {
+        let mapping = if let Some(mapping) = self.data_dir_inode_mapping.get(&inode.data_dir_inode)
+        {
             mapping
         } else {
             return Ok(None);
@@ -114,9 +110,23 @@ impl OpenedFiles {
             flags,
             needs_sync: false,
             file: new_file,
-            refs: handler.refs.clone(),
+            refs: Some(References {
+                inode,
+                path: handler.refs.as_ref().unwrap().path.clone(),
+            }),
         };
+
+        // Update mappings and files
         let _ = self.handlers.insert(new_fh, new_handler);
+        self.data_dir_inode_mapping
+            .entry(inode.data_dir_inode)
+            .or_insert_with(HashSet::new)
+            .insert(new_fh);
+        self.mount_point_inode_mapping
+            .entry(inode.mount_point_inode)
+            .or_insert_with(HashSet::new)
+            .insert(new_fh);
+
         Ok(Some(new_fh))
     }
 
@@ -157,7 +167,6 @@ impl OpenedFiles {
                 .mount_point_inode_mapping
                 .remove(&handler.refs.as_ref().unwrap().inode.mount_point_inode);
             handler.refs = None;
-            self.handlers.get_mut(fh).unwrap().refs = None;
         });
         Some(handlers)
     }

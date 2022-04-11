@@ -524,7 +524,7 @@ impl ZstdFS {
         // Already opened by some other process
         if let Some(fh) = self
             .opened_files
-            .duplicate(dd_ino, flags)
+            .duplicate(Inode::new(Some(ino), Some(dd_ino)), flags)
             .map_err(convert_io_error)?
         {
             return Ok(fh);
@@ -717,7 +717,6 @@ impl ZstdFS {
         let ino = fs::metadata(&path).map_err(convert_io_error)?.st_ino();
         fs::remove_file(path).map_err(convert_io_error)?;
         self.icache().del_inode_path(Inode::new_dd(ino));
-        // TODO how to unlink expired files
         self.opened_files.unlink(ino);
         Ok(())
     }
@@ -811,13 +810,13 @@ impl Filesystem for ZstdFS {
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         debug!(
-            "Lookup (iparent=0x{:16x}, name='{}')",
+            "Lookup (iparent=0x{:016x}, name='{}')",
             parent,
             name.to_str().unwrap_or_default()
         );
         match self.lookup_wrapper(parent, name) {
             Ok(attrs) => {
-                debug!("Lookup OK (inode=0x{:16x})", attrs.ino);
+                debug!("Lookup OK (inode=0x{:016x})", attrs.ino);
                 reply.entry(&cache::TTL, &attrs, 0);
             }
             Err(err) => {
@@ -828,7 +827,7 @@ impl Filesystem for ZstdFS {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        debug!("Getattr (inode=0x{:16x})", ino);
+        debug!("Getattr (inode=0x{:016x})", ino);
         match self.getattr_wrapper(ino) {
             Ok(attrs) => {
                 debug!("getattr ok");
@@ -860,7 +859,7 @@ impl Filesystem for ZstdFS {
         reply: ReplyAttr,
     ) {
         debug!(
-            "Setattr (inode=0x{:16x}, fh={:?}, mode={:?}, uid={:?}, gid={:?}, ...)",
+            "Setattr (inode=0x{:016x}, fh={:?}, mode={:?}, uid={:?}, gid={:?}, ...)",
             ino, fh, mode, uid, gid,
         );
         match self.setattr_wrapper(
@@ -889,7 +888,7 @@ impl Filesystem for ZstdFS {
         reply: ReplyData,
     ) {
         debug!(
-            "Read (inode=0x{:16x}, offset={}, size={}, fh={})",
+            "Read (inode=0x{:016x}, offset={}, size={}, fh={})",
             ino, offset, size, fh
         );
         match self.read_wrapper(ino, fh, offset, size) {
@@ -913,7 +912,7 @@ impl Filesystem for ZstdFS {
         mut reply: ReplyDirectory,
     ) {
         debug!(
-            "Readdir (inode=0x{:16x}, offset={}, fh={})",
+            "Readdir (inode=0x{:016x}, offset={}, fh={})",
             ino, offset, fh
         );
         match self.readdir_wrapper(ino, fh, offset, &mut reply) {
@@ -927,7 +926,7 @@ impl Filesystem for ZstdFS {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-        debug!("Open (inode=0x{:16x}, flags={:x})", ino, flags);
+        debug!("Open (inode=0x{:016x}, flags={:x})", ino, flags);
         match self.open_wrapper(ino, flags) {
             Ok(fh) => {
                 debug!("opened (fh={})", fh);
@@ -950,18 +949,18 @@ impl Filesystem for ZstdFS {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!("Release (inode=0x{:16x}, fh={})", ino, fh);
+        debug!("Release (inode=0x{:016x}, fh={})", ino, fh);
         match self.release_wrapper(ino, fh) {
             Ok(()) => {
                 debug!("released");
                 reply.ok();
             }
             Err(libc::EBADF) => {
-                debug!("Already released (inode=0x{:16x}, fh={})", ino, fh);
+                debug!("Already released (inode=0x{:016x}, fh={})", ino, fh);
                 reply.ok();
             }
             Err(err) => {
-                warn!("Release error (inode=0x{:16x}, fh={})", ino, fh);
+                warn!("Release error (inode=0x{:016x}, fh={})", ino, fh);
                 reply.error(err);
             }
         }
@@ -978,12 +977,12 @@ impl Filesystem for ZstdFS {
         reply: fuser::ReplyCreate,
     ) {
         debug!(
-            "Create (iparent=0x{:16x}, name={:?}, mode={:o}, umask={:o}, flags={:x})",
+            "Create (iparent=0x{:016x}, name={:?}, mode={:o}, umask={:o}, flags={:x})",
             parent, name, mode, umask, flags
         );
         match self.create_wrapper(parent, name, mode, umask, flags) {
             Ok((attrs, fh)) => {
-                debug!("created (inode=0x{:16x}, fh={})", attrs.ino, fh);
+                debug!("created (inode=0x{:016x}, fh={})", attrs.ino, fh);
                 reply.created(&cache::TTL, &attrs, 0, fh, flags as u32);
             }
             Err(err) => {
@@ -1006,7 +1005,7 @@ impl Filesystem for ZstdFS {
         reply: fuser::ReplyWrite,
     ) {
         debug!(
-            "Write (ino=0x{:16x}, fh={}, offset={}, data_len={}, write_flags={:x}, flags={:x}), lock={:?}",
+            "Write (ino=0x{:016x}, fh={}, offset={}, data_len={}, write_flags={:x}, flags={:x}), lock={:?}",
             ino, fh, offset, data.len(), write_flags, flags, lock_owner
         );
         match self.write_wrapper(ino, fh, offset, data, write_flags, flags, lock_owner) {
@@ -1030,12 +1029,12 @@ impl Filesystem for ZstdFS {
         reply: ReplyEntry,
     ) {
         debug!(
-            "Mkdir (iparent=0x{:16x}, name={:?}, mode={:o}, umask={:o})",
+            "Mkdir (iparent=0x{:016x}, name={:?}, mode={:o}, umask={:o})",
             parent, name, mode, umask
         );
         match self.mkdir_wrapper(parent, name, mode, umask) {
             Ok(attrs) => {
-                debug!("mkdir passed (ino=0x{:16x})", attrs.ino);
+                debug!("mkdir passed (ino=0x{:016x})", attrs.ino);
                 reply.entry(&cache::TTL, &attrs, 0);
             }
             Err(err) => {
@@ -1046,7 +1045,7 @@ impl Filesystem for ZstdFS {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        debug!("Unlink (iparent=0x{:16x}, name={:?})", parent, name,);
+        debug!("Unlink (iparent=0x{:016x}, name={:?})", parent, name,);
         match self.unlink_wrapper(parent, name) {
             Ok(()) => {
                 debug!("unlink passed");
@@ -1060,7 +1059,7 @@ impl Filesystem for ZstdFS {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        debug!("Rmdir (iparent=0x{:16x}, name={:?})", parent, name,);
+        debug!("Rmdir (iparent=0x{:016x}, name={:?})", parent, name,);
         match self.rmdir_wrapper(parent, name) {
             Ok(()) => {
                 debug!("rmdir passed");
@@ -1084,7 +1083,7 @@ impl Filesystem for ZstdFS {
         reply: fuser::ReplyEmpty,
     ) {
         debug!(
-            "Rename (from_iparent=0x{:16x}, from_name={:?}, to_iparent=0x{:16x}, to_iname={:?}, flags={:x})",
+            "Rename (from_iparent=0x{:016x}, from_name={:?}, to_iparent=0x{:016x}, to_iname={:?}, flags={:x})",
             parent, name, newparent, newname, flags
         );
         match self.rename_wrapper(parent, name, newparent, newname, flags) {
@@ -1108,7 +1107,7 @@ impl Filesystem for ZstdFS {
         reply: fuser::ReplyEmpty,
     ) {
         debug!(
-            "Fsync (ino=0x{:16x}, fh={:?}, datasync={:?})",
+            "Fsync (ino=0x{:016x}, fh={:?}, datasync={:?})",
             ino, fh, datasync
         );
         match self.fsync_wrapper(ino, fh, datasync) {
@@ -1132,7 +1131,7 @@ impl Filesystem for ZstdFS {
         reply: fuser::ReplyEmpty,
     ) {
         debug!(
-            "Flush (ino=0x{:16x}, fh={:?}, lock_owner={:?}",
+            "Flush (ino=0x{:016x}, fh={:?}, lock_owner={:?}",
             ino, fh, lock_owner
         );
         match self.flush_wrapper(ino, fh, lock_owner) {
