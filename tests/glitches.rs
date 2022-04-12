@@ -225,7 +225,13 @@ fn flush(#[case] mounted_fs: utils::FuseZstdProcess) {
         fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
         "Writing doesn't touch compressed file",
     );
-    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "ORIGINAL");
+    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "OVERRIDE");
+
+    assert_eq!(
+        original_ino,
+        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
+        "Write should not affect file in data dir",
+    );
 
     // closing cloned fd should trigger flush
     let cloned_file = file.try_clone().unwrap();
