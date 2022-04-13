@@ -1259,8 +1259,10 @@ fn main() -> io::Result<()> {
         MountOption::AllowOther,
     ];
     info!(
-        "Starting fuse-zstd with compression level={}, convert={}",
-        compression_level, convert,
+        "Starting fuse-zstd ({}) with compression level={}, convert={}",
+        crate_version!(),
+        compression_level,
+        convert,
     );
     fuser::mount2(
         ZstdFS::new(data_dir, compression_level, convert)?,
