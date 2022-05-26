@@ -1,6 +1,5 @@
 mod cache;
 mod file;
-mod inode;
 
 use clap::{crate_authors, crate_name, crate_version, Arg, Command};
 use fuser::{
@@ -14,14 +13,14 @@ use std::{
     io::{self, Seek, SeekFrom},
     os::{
         linux::fs::MetadataExt,
-        unix::fs::{DirEntryExt, FileExt, PermissionsExt},
+        unix::fs::{FileExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
 };
 use xattr::FileExt as XattrFileExt;
 
-use crate::inode::Inode;
+type Inode = u64;
 
 struct FileAttrWrapper {
     file_attr: FileAttr,
@@ -75,57 +74,6 @@ fn access_all(fa: &mut FileAttr) {
     }
 }
 
-fn store_to_source_file<P1, P2>(
-    source: &fs::File,
-    dir_path: P1,
-    name: P2,
-    compression_level: u8,
-) -> Result<(fs::File, Option<fs::File>), libc::c_int>
-where
-    P1: AsRef<Path>,
-    P2: AsRef<Path>,
-{
-    // Atomically creates file in source directory
-    let tmp_file = tempfile::NamedTempFile::new_in(dir_path.as_ref()).map_err(convert_io_error)?;
-    let path = dir_path.as_ref().join(name.as_ref());
-    let orig_file = fs::File::open(&path).ok();
-    source.sync_all().map_err(convert_io_error)?;
-
-    let real_size = source.metadata().map_err(convert_io_error)?.st_size();
-    debug!("Before compression {}", real_size);
-
-    let mut cloned_source = source.try_clone().map_err(convert_io_error)?;
-    cloned_source
-        .seek(SeekFrom::Start(0))
-        .map_err(convert_io_error)?;
-    // Compress file
-    let mut encoder = zstd::stream::Encoder::new(
-        tmp_file.reopen().map_err(convert_io_error)?,
-        compression_level as i32,
-    )
-    .map_err(convert_io_error)?;
-    encoder
-        .set_pledged_src_size(Some(real_size))
-        .map_err(convert_io_error)?;
-    encoder.include_checksum(true).map_err(convert_io_error)?;
-    io::copy(&mut cloned_source, &mut encoder).map_err(convert_io_error)?;
-    encoder.finish().map_err(convert_io_error)?;
-
-    // Should atomically mode file to its destination
-    let file = tmp_file.persist(&path).map_err(convert_io_error)?;
-    file.sync_all().map_err(convert_io_error)?;
-    debug!(
-        "After compression {}",
-        file.metadata().map_err(convert_io_error)?.st_size()
-    );
-
-    // update filesize in xattrs
-    file.set_xattr("user.real_size", &real_size.to_be_bytes())
-        .map_err(convert_io_error)?;
-
-    Ok((file, orig_file))
-}
-
 impl TryFrom<fs::DirEntry> for FileAttrWrapper {
     type Error = io::Error;
     fn try_from(dir_entry: fs::DirEntry) -> Result<Self, Self::Error> {
@@ -161,8 +109,9 @@ impl TryFrom<fs::Metadata> for FileAttrWrapper {
 
 struct ZstdFS {
     compression_level: u8,
-    tree_dir: PathBuf,
+    data_dir: PathBuf,
     opened_files: file::OpenedFiles,
+    inode_idx: u64,
     inode_cache: Option<cache::InodeCache>,
     /// Convert uncompressed data from original directory
     /// to compressed files
@@ -170,18 +119,24 @@ struct ZstdFS {
 }
 
 impl ZstdFS {
-    fn new(tree_dir: String, compression_level: u8, convert: bool) -> io::Result<ZstdFS> {
+    fn new(
+        data_dir: String,
+        compression_level: u8,
+        convert: bool,
+        inode_idx: u64,
+    ) -> io::Result<ZstdFS> {
         Ok(Self {
             compression_level,
             inode_cache: None,
-            tree_dir: tree_dir.into(),
+            data_dir: data_dir.into(),
             opened_files: file::OpenedFiles::new(),
             convert,
+            inode_idx,
         })
     }
 
-    fn tree_dir(&self) -> PathBuf {
-        self.tree_dir.clone()
+    fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone()
     }
 
     #[inline]
@@ -190,8 +145,8 @@ impl ZstdFS {
     }
 
     fn get_path(&mut self, ino: Inode) -> Result<PathBuf, libc::c_int> {
-        if ino.mount_point_inode == FUSE_ROOT_ID {
-            Ok(self.tree_dir().clone())
+        if ino == FUSE_ROOT_ID {
+            Ok(self.data_dir().clone())
         } else {
             if let Ok(path) = self.icache().get_inode_path(ino) {
                 return Ok(Path::new(&path).to_path_buf());
@@ -200,21 +155,7 @@ impl ZstdFS {
             // Try to search through opened file descriptios
             if let Some(fhs) = self
                 .opened_files
-                .get_fhs_from_data_dir_inode(ino.data_dir_inode)
-                .map(|e| e.to_owned())
-            {
-                for fh in fhs {
-                    if let Some(handler) = self.opened_files.get(fh) {
-                        if let Some(refs) = handler.refs.as_ref() {
-                            return Ok(refs.path.clone());
-                        }
-                    }
-                }
-            }
-
-            if let Some(fhs) = self
-                .opened_files
-                .get_fhs_from_mount_point_inode(ino.mount_point_inode)
+                .get_fhs_from_mount_point_inode(ino)
                 .map(|e| e.to_owned())
             {
                 for fh in fhs {
@@ -227,34 +168,6 @@ impl ZstdFS {
             }
 
             Err(libc::ENOENT)
-        }
-    }
-
-    fn get_data_dir_inode(&mut self, mount_point_inode: u64) -> Result<u64, libc::c_int> {
-        if mount_point_inode == FUSE_ROOT_ID {
-            Ok(fs::metadata(&self.tree_dir)
-                .map_err(convert_io_error)?
-                .st_ino())
-        } else {
-            if let Some(ino) = self.icache().get_data_dir_inode(mount_point_inode) {
-                Ok(ino)
-            } else {
-                if let Some(fhs) = self
-                    .opened_files
-                    .get_fhs_from_mount_point_inode(mount_point_inode)
-                    .map(|e| e.to_owned())
-                {
-                    for fh in fhs {
-                        if let Some(handler) = self.opened_files.get(fh) {
-                            if let Some(refs) = handler.refs.as_ref() {
-                                return Ok(refs.inode.data_dir_inode);
-                            }
-                        }
-                    }
-                }
-
-                Err(libc::ENOENT)
-            }
         }
     }
 
@@ -280,27 +193,13 @@ impl ZstdFS {
                 let source_path = refs.path;
                 let dir_path = source_path.parent().unwrap().to_path_buf();
 
-                let (source_file, _) = store_to_source_file(
+                let (source_file, _) = self.store_to_source_file(
                     &file,
                     &dir_path,
                     source_path.file_name().unwrap(),
                     self.compression_level,
                 )?;
                 source_file.sync_all().map_err(convert_io_error)?;
-
-                // update caches -> new inode
-                let metadata = source_file.metadata().map_err(convert_io_error)?;
-
-                // inode changed -> set new inode path
-                // also keep the original inode -> path mapping
-                // so that it can be used for further querying
-                debug!("New inode 0x{:016x}", metadata.st_ino());
-
-                // Updating old ino to new ino
-                self.opened_files
-                    .update_ino(refs.inode.data_dir_inode, metadata.st_ino());
-                self.icache()
-                    .set_inode_path(Inode::new_dd(metadata.st_ino()), source_path, "")?;
 
                 // update needs_update because the file was synced
                 if !close {
@@ -315,7 +214,7 @@ impl ZstdFS {
     }
 
     fn lookup_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, libc::c_int> {
-        let path = self.get_path(Inode::new_mp(parent))?;
+        let path = self.get_path(parent)?;
         let entries = fs::read_dir(&path).map_err(convert_io_error)?;
         let name = name.to_string_lossy().to_string();
         for entry in entries {
@@ -328,13 +227,14 @@ impl ZstdFS {
                 name.clone()
             };
             if entry.file_name().to_string_lossy() == filename {
-                let ino =
-                    self.icache()
-                        .set_inode_path(Inode::new_dd(entry.ino()), &path, &filename)?;
+                // Try to check the cache first
                 let mut faw = FileAttrWrapper::try_from(entry).map_err(convert_io_error)?;
                 // Update size from extended attributes
-                let file = fs::File::open(path.join(filename)).map_err(convert_io_error)?;
+                let file = fs::File::open(path.join(&filename)).map_err(convert_io_error)?;
                 faw.update_realsize(&file)?;
+                let ino = self.update_inode(&file).map_err(convert_io_error)?;
+                // Touch cache
+                self.icache().set_inode_path(ino, &path, filename)?;
 
                 let mut attrs: FileAttr = faw.into();
                 // allow access to all
@@ -365,8 +265,12 @@ impl ZstdFS {
                 {
                     let zname = format!("{}.zst", &name);
                     let source_file = fs::File::open(path.join(&name)).map_err(convert_io_error)?;
-                    let (file, _) =
-                        store_to_source_file(&source_file, &path, &zname, self.compression_level)?;
+                    let (file, _) = self.store_to_source_file(
+                        &source_file,
+                        &path,
+                        &zname,
+                        self.compression_level,
+                    )?;
                     file.sync_all().map_err(convert_io_error)?;
 
                     // File was copied now we can remove the original
@@ -377,14 +281,15 @@ impl ZstdFS {
                     )
                     .map_err(convert_io_error)?;
                     faw.update_realsize(&file)?;
+                    // Try to updat inode
+                    let ino = self.update_inode(&file).map_err(convert_io_error)?;
+                    // Touch cache
+                    self.icache().set_inode_path(ino, path, zname)?;
 
                     let mut attrs: FileAttr = faw.into();
                     // allow access to all
                     access_all(&mut attrs);
 
-                    let ino =
-                        self.icache()
-                            .set_inode_path(Inode::new_dd(attrs.ino), path, zname)?;
                     attrs.ino = ino;
 
                     return Ok(attrs);
@@ -401,7 +306,7 @@ impl ZstdFS {
         offset: i64,
         reply: &mut ReplyDirectory,
     ) -> Result<(), libc::c_int> {
-        let file_path = self.get_path(Inode::new_mp(ino))?;
+        let file_path = self.get_path(ino)?;
         let metadata = fs::metadata(&file_path).map_err(convert_io_error)?;
         if !metadata.is_dir() {
             return Err(libc::ENOTDIR);
@@ -415,32 +320,46 @@ impl ZstdFS {
             let file_type = convert_ft(entry.file_type().map_err(convert_io_error)?)
                 .map_err(convert_io_error)?;
 
-            let file_name = entry.file_name().to_string_lossy().to_string();
+            let orig_file_name = entry.file_name().to_string_lossy().to_string();
 
             let file_name = match file_type {
                 FileType::RegularFile => {
-                    if !file_name.ends_with(".zst") {
+                    if !orig_file_name.ends_with(".zst") {
                         if !self.convert {
                             // Hide non-zstd file in non converting mode
                             continue;
                         } else {
-                            file_name
+                            orig_file_name.clone()
                         }
                     } else {
-                        file_name.strip_suffix(".zst").unwrap().to_string()
+                        orig_file_name.strip_suffix(".zst").unwrap().to_string()
                     }
                 }
-                FileType::Directory => file_name,
+                FileType::Directory => orig_file_name.clone(),
                 _ => {
                     // skip other types
                     continue;
                 }
             };
 
-            // Refresh caches
-            let entry_ino =
-                self.icache()
-                    .set_inode_path(Inode::new_dd(entry.ino()), &file_path, &file_name)?;
+            // read ino from extended attributes
+            let entry_path = file_path.join(&orig_file_name);
+            let entry_ino_opt = xattr::get(&entry_path, "user.ino")
+                .map_err(convert_io_error)?
+                .map(|e| u64::from_be_bytes(e.try_into().unwrap()));
+            let entry_ino = if let Some(ino) = entry_ino_opt {
+                // Ino exists
+                ino
+            } else {
+                // Make new inode
+                let ino = self.update_inode_idx().map_err(convert_io_error)?;
+                xattr::set(entry_path, "user.ino", &ino.to_be_bytes()).map_err(convert_io_error)?;
+                ino
+            };
+
+            // update the cache
+            self.icache()
+                .set_inode_path(entry_ino, &file_path, orig_file_name)?;
 
             debug!(
                 "Entry 0x{:016x}, {}, {:?}, {:?}",
@@ -457,7 +376,7 @@ impl ZstdFS {
     }
 
     fn getattr_wrapper(&mut self, ino: u64) -> Result<FileAttr, libc::c_int> {
-        let file_path = self.get_path(Inode::new_mp(ino))?;
+        let file_path = self.get_path(ino)?;
         let file = fs::File::open(file_path).map_err(convert_io_error)?;
         let metadata = file.metadata().map_err(convert_io_error)?;
         let mut faw: FileAttrWrapper = metadata.try_into().map_err(convert_io_error)?;
@@ -519,18 +438,15 @@ impl ZstdFS {
     }
 
     fn open_wrapper(&mut self, ino: u64, flags: i32) -> Result<u64, libc::c_int> {
-        let dd_ino = self.get_data_dir_inode(ino)?;
-
         // Already opened by some other process
         if let Some(fh) = self
             .opened_files
-            .duplicate(Inode::new(Some(ino), Some(dd_ino)), flags)
+            .duplicate(ino, flags)
             .map_err(convert_io_error)?
         {
             return Ok(fh);
         }
-
-        let file_path = self.get_path(Inode::new_mp(ino))?;
+        let file_path = self.get_path(ino)?;
         let source_file = fs::File::open(&file_path).map_err(convert_io_error)?;
         let mut target_file = tempfile::tempfile().map_err(convert_io_error)?;
         zstd::stream::copy_decode(
@@ -559,12 +475,7 @@ impl ZstdFS {
         // Store info about newly opened file
         let fh = self
             .opened_files
-            .insert(
-                Inode::new(Some(ino), Some(dd_ino)),
-                flags,
-                target_file,
-                file_path,
-            )
+            .insert(ino, flags, target_file, file_path)
             .ok_or(libc::EBUSY)?;
 
         Ok(fh)
@@ -578,7 +489,7 @@ impl ZstdFS {
         size: u32,
     ) -> Result<Vec<u8>, libc::c_int> {
         // Hit the cache
-        let _ = self.get_path(Inode::new_mp(ino));
+        let _ = self.get_path(ino);
 
         let file_handler = self.opened_files.get_mut(fh).ok_or(libc::ENOENT)?;
         let mut res = vec![0; size as usize];
@@ -600,13 +511,13 @@ impl ZstdFS {
     ) -> Result<(FileAttr, u64), libc::c_int> {
         // Create emtpy file in the tree dir
         let name = name.to_string_lossy().to_string() + ".zst";
-        let parent_path = self.get_path(Inode::new_mp(parent))?;
+        let parent_path = self.get_path(parent)?;
 
         let opened_file = tempfile::tempfile().map_err(convert_io_error)?;
 
         // Write new file to source directory
         let (source_file, _) =
-            store_to_source_file(&opened_file, &parent_path, &name, self.compression_level)?;
+            self.store_to_source_file(&opened_file, &parent_path, &name, self.compression_level)?;
         source_file.sync_all().map_err(convert_io_error)?;
 
         // Obtain attrs of the new file
@@ -616,24 +527,25 @@ impl ZstdFS {
 
         // allow access to all
         access_all(&mut attrs);
-
+        // user.ino has to be se in store_to_source_file()
+        // so we need to read it here
+        attrs.ino = u64::from_be_bytes(
+            source_file
+                .get_xattr("user.ino")
+                .unwrap()
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         // add inode to map
-        let ino = self
-            .icache()
-            .set_inode_path(Inode::new_dd(attrs.ino), &parent_path, &name)?;
+        self.icache()
+            .set_inode_path(attrs.ino, &parent_path, &name)?;
 
         // New file handler
         let fh = self
             .opened_files
-            .insert(
-                Inode::new(Some(ino), Some(attrs.ino)),
-                flags,
-                opened_file,
-                parent_path.join(&name),
-            )
+            .insert(attrs.ino, flags, opened_file, parent_path.join(&name))
             .ok_or(libc::EBUSY)?;
-
-        attrs.ino = ino;
 
         Ok((attrs, fh as u64))
     }
@@ -650,7 +562,7 @@ impl ZstdFS {
         _lock_owner: Option<u64>,
     ) -> Result<usize, libc::c_int> {
         // Hit the cache
-        let _ = self.get_path(Inode::new_mp(ino));
+        let _ = self.get_path(ino);
 
         let mut file_handler = self.opened_files.get_mut(fh).ok_or(libc::EBADF)?;
 
@@ -689,44 +601,48 @@ impl ZstdFS {
         _mode: u32,
         _umask: u32,
     ) -> Result<FileAttr, libc::c_int> {
-        let parent_path = self.get_path(Inode::new_mp(parent))?;
+        let parent_path = self.get_path(parent)?;
         let path = parent_path.join(name);
         fs::create_dir(&path).map_err(convert_io_error)?;
-        let metadata = fs::metadata(path).map_err(convert_io_error)?;
+        let metadata = fs::metadata(&path).map_err(convert_io_error)?;
 
         let faw: FileAttrWrapper = metadata.try_into().map_err(convert_io_error)?;
         let mut attrs: FileAttr = faw.into();
         // allow access to all
         access_all(&mut attrs);
+        attrs.ino = self.update_inode_idx().map_err(convert_io_error)?;
+
+        // store ino
+        xattr::set(path, "user.ino", &attrs.ino.to_be_bytes()).map_err(convert_io_error)?;
 
         // update inode map
-        let ino = self.icache().set_inode_path(
-            Inode::new_dd(attrs.ino),
-            parent_path,
-            name.to_string_lossy(),
-        )?;
-
-        attrs.ino = ino;
+        self.icache()
+            .set_inode_path(attrs.ino, parent_path, name.to_string_lossy())?;
 
         Ok(attrs)
     }
 
     fn unlink_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<(), libc::c_int> {
-        let parent_path = self.get_path(Inode::new_mp(parent))?;
+        let parent_path = self.get_path(parent)?;
         let path = parent_path.join(name.to_string_lossy().to_string() + ".zst");
-        let ino = fs::metadata(&path).map_err(convert_io_error)?.st_ino();
+        if let Some(ino_data) = xattr::get(&path, "user.ino").map_err(convert_io_error)? {
+            let ino = u64::from_be_bytes(ino_data.try_into().unwrap());
+            self.icache().del_inode_path(ino);
+            self.opened_files.unlink(ino);
+        }
         fs::remove_file(path).map_err(convert_io_error)?;
-        self.icache().del_inode_path(Inode::new_dd(ino));
-        self.opened_files.unlink(ino);
         Ok(())
     }
 
     fn rmdir_wrapper(&mut self, parent: u64, name: &OsStr) -> Result<(), libc::c_int> {
-        let parent_path = self.get_path(Inode::new_mp(parent))?;
+        let parent_path = self.get_path(parent)?;
         let path = parent_path.join(name.to_string_lossy().to_string());
-        let ino = fs::metadata(&path).map_err(convert_io_error)?.st_ino();
+        if let Some(ino_data) = xattr::get(&path, "user.ino").map_err(convert_io_error)? {
+            let ino = u64::from_be_bytes(ino_data.try_into().unwrap());
+            self.icache().del_inode_path(ino);
+            self.opened_files.unlink(ino);
+        }
         fs::remove_dir(path).map_err(convert_io_error)?;
-        self.icache().del_inode_path(Inode::new_dd(ino));
         Ok(())
     }
 
@@ -757,26 +673,20 @@ impl ZstdFS {
             }
         };
 
-        let from_path = self.get_path(Inode::new_mp(parent))?.join(name);
+        let from_path = self.get_path(parent)?.join(name);
 
-        let to_parent_path = self.get_path(Inode::new_mp(newparent))?;
+        let to_parent_path = self.get_path(newparent)?;
         let to_path = to_parent_path.join(&newname);
 
         if let Some(orig_ino) = fs::metadata(&to_path).ok().map(|e| e.st_ino()) {
-            self.icache().del_inode_path(Inode::new_dd(orig_ino));
+            self.icache().del_inode_path(orig_ino);
             self.opened_files.unlink(orig_ino);
         }
 
         fs::rename(from_path, &to_path).map_err(convert_io_error)?;
 
-        let new_ino = fs::metadata(&to_path).unwrap().st_ino();
-
         // Update inode mapping
-        self.icache().set_inode_path(
-            Inode::new(Some(ino), Some(new_ino)),
-            to_parent_path,
-            newname,
-        )?;
+        self.icache().set_inode_path(ino, to_parent_path, newname)?;
 
         // TODO update opened files to match path
         // without update the opened files will be written to old location
@@ -793,6 +703,119 @@ impl ZstdFS {
         self.sync_to_fs(fh, false, false)?;
         Ok(())
     }
+
+    fn update_inode_idx(&mut self) -> io::Result<u64> {
+        let res = self.inode_idx;
+
+        if self.inode_idx - 1 <= FUSE_ROOT_ID {
+            log::warn!("Fuse inodes counter rotated");
+            // Note that this should never happen
+            // fuse-zstd should be running for ceturies to achieve this...
+            self.inode_idx = u64::MAX;
+        }
+        self.inode_idx -= 1;
+
+        debug!(
+            "Updating 'ino_idx' at root {} to 0x{:016x}",
+            self.data_dir().display(),
+            self.inode_idx
+        );
+        xattr::set(
+            &self.data_dir,
+            "user.ino_idx",
+            &self.inode_idx.to_be_bytes(),
+        )?;
+
+        Ok(res)
+    }
+
+    fn update_inode(&mut self, f: &fs::File) -> io::Result<Inode>
+where {
+        if let Some(data) = f.get_xattr("user.ino")? {
+            Ok(u64::from_be_bytes(data.try_into().unwrap()))
+        } else {
+            let ino = self.update_inode_idx()?;
+            f.set_xattr("user.ino", &ino.to_be_bytes())?;
+            Ok(ino)
+        }
+    }
+
+    fn store_to_source_file<P1, P2>(
+        &mut self,
+        source: &fs::File,
+        dir_path: P1,
+        name: P2,
+        compression_level: u8,
+    ) -> Result<(fs::File, Option<fs::File>), libc::c_int>
+    where
+        P1: AsRef<Path>,
+        P2: AsRef<Path>,
+    {
+        // Atomically creates file in source directory
+        let tmp_file =
+            tempfile::NamedTempFile::new_in(dir_path.as_ref()).map_err(convert_io_error)?;
+        let path = dir_path.as_ref().join(name.as_ref());
+        let orig_file = fs::File::open(&path).ok();
+
+        source.sync_all().map_err(convert_io_error)?;
+
+        let real_size = source.metadata().map_err(convert_io_error)?.st_size();
+        debug!("Before compression {}", real_size);
+
+        let mut cloned_source = source.try_clone().map_err(convert_io_error)?;
+        cloned_source
+            .seek(SeekFrom::Start(0))
+            .map_err(convert_io_error)?;
+        // Compress file
+        let mut encoder = zstd::stream::Encoder::new(
+            tmp_file.reopen().map_err(convert_io_error)?,
+            compression_level as i32,
+        )
+        .map_err(convert_io_error)?;
+        encoder
+            .set_pledged_src_size(Some(real_size))
+            .map_err(convert_io_error)?;
+        encoder.include_checksum(true).map_err(convert_io_error)?;
+        io::copy(&mut cloned_source, &mut encoder).map_err(convert_io_error)?;
+        encoder.finish().map_err(convert_io_error)?;
+
+        // Try to update the ino of tmp file
+        match xattr::get(&path, "user.ino") {
+            Ok(Some(ino_data)) => {
+                tmp_file
+                    .as_file()
+                    .set_xattr("user.ino", &ino_data)
+                    .map_err(convert_io_error)?;
+            }
+            _ => {
+                // Error or None -> create new ino
+                tmp_file
+                    .as_file()
+                    .set_xattr(
+                        "user.ino",
+                        &self
+                            .update_inode_idx()
+                            .map_err(convert_io_error)?
+                            .to_be_bytes(),
+                    )
+                    .map_err(convert_io_error)?;
+            }
+        }
+
+        // Should atomically mode file to its destination
+        let file = tmp_file.persist(&path).map_err(convert_io_error)?;
+        file.sync_all().map_err(convert_io_error)?;
+        debug!(
+            "After compression {}",
+            file.metadata().map_err(convert_io_error)?.st_size()
+        );
+
+        // update filesize in xattrs
+        file.set_xattr("user.real_size", &real_size.to_be_bytes())
+            .map_err(convert_io_error)?;
+
+        Ok((file, orig_file))
+    }
 }
 
 impl Filesystem for ZstdFS {
@@ -801,7 +824,7 @@ impl Filesystem for ZstdFS {
         _req: &Request<'_>,
         _config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
-        fs::create_dir_all(Path::new(&self.tree_dir())).map_err(convert_io_error)?;
+        fs::create_dir_all(Path::new(&self.data_dir())).map_err(convert_io_error)?;
 
         self.inode_cache = Some(cache::InodeCache::new()?);
 
@@ -1264,8 +1287,15 @@ fn main() -> io::Result<()> {
         compression_level,
         convert,
     );
+
+    // Read fuse-zstd inode index from
+    let inode_idx = xattr::get(&data_dir, "user.ino_idx")?
+        .map(|e| u64::from_be_bytes(e.to_vec().try_into().unwrap()))
+        .unwrap_or(u64::MAX);
+    debug!("Root inode index 0x{:016x}", inode_idx);
+
     fuser::mount2(
-        ZstdFS::new(data_dir, compression_level, convert)?,
+        ZstdFS::new(data_dir, compression_level, convert, inode_idx)?,
         mountpoint,
         &options,
     )
