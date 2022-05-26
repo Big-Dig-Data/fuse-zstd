@@ -2,7 +2,7 @@ mod cache;
 mod file;
 mod inode;
 
-use clap::{crate_authors, crate_name, crate_version, App, Arg};
+use clap::{crate_authors, crate_name, crate_version, Arg, Command};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request, FUSE_ROOT_ID,
@@ -1148,11 +1148,11 @@ impl Filesystem for ZstdFS {
 }
 
 fn main() -> io::Result<()> {
-    let app = App::new(crate_name!())
+    let app = Command::new(crate_name!())
         .version(crate_version!())
         .author(crate_authors!())
         .arg(
-            Arg::with_name("mount-point")
+            Arg::new("mount-point")
                 .long("mount-point")
                 .value_name("MOUNT_POINT")
                 .default_value("")
@@ -1161,7 +1161,7 @@ fn main() -> io::Result<()> {
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("data-dir")
+            Arg::new("data-dir")
                 .long("data-dir")
                 .value_name("DATA_DIR")
                 .default_value("/tmp/zstdfs/")
@@ -1170,8 +1170,8 @@ fn main() -> io::Result<()> {
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("compression-level")
-            .short("-c")
+            Arg::new("compression-level")
+            .short('c')
             .long("compression-level")
             .value_name("LEVEL")
             .default_value("0")
@@ -1180,20 +1180,20 @@ fn main() -> io::Result<()> {
             .takes_value(true)
         )
         .arg(
-            Arg::with_name("v")
-                .short("v")
-                .multiple(true)
+            Arg::new("v")
+                .short('v')
+                .multiple_occurrences(true)
                 .help("Sets the level of verbosity"),
         )
         .arg(
-            Arg::with_name("convert")
+            Arg::new("convert")
                 .long("convert")
                 .help("Will convert files uncompressed files from data dir"),
         );
 
     #[cfg(feature = "with_sentry")]
     let app = app.arg(
-        Arg::with_name("sentry-url")
+        Arg::new("sentry-url")
             .long("sentry-url")
             .default_value("")
             .help("Sentry url where events will be sent")

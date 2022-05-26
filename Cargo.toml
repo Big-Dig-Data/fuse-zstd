@@ -20,22 +20,22 @@ with_sentry = [
 ]
 
 [dependencies]
-clap = "2"
+clap = { version="3", features = ["env", "cargo"] }
 env_logger = "0.9"
 fuser = "0.11"
 libc = "0.2"
 log = "0.4"
 lru_time_cache = "0.11"
-sentry = { version = "0.25.0", features = ["log"], optional = true }
-sentry-log = { version = "0.25.0", optional = true }
+sentry = { version = "0.26.0", features = ["log"], optional = true }
+sentry-log = { version = "0.26.0", optional = true }
 tempfile = "3"
 xattr = "0.2"
-zstd = "0.10"
+zstd = "0.11"
 
 [dev-dependencies]
-rstest = "0.12"
+rstest = "0.13"
 assert_cmd = "2.0"
-proc-mounts = "0.2"
+proc-mounts = "0.3"
 
 [package.metadata.deb]
 maintainer-scripts = "debian/"
