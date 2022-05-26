@@ -6,6 +6,10 @@ use crate::inode::Inode;
 
 pub const TTL: Duration = Duration::from_secs(1); // dcache lifetime
 
+/// Max dcache capacity how many directories can be opened
+/// without loosing inode info
+pub const CAPACITY: usize = 10_000; // MAX inode cache capacity
+
 pub struct InodeCache {
     new_inode_idx: u64,
     inode_db: LruCache<u128, Vec<u8>>,
@@ -15,7 +19,7 @@ impl InodeCache {
     pub fn new() -> Result<Self, libc::c_int> {
         Ok(Self {
             new_inode_idx: u64::MAX,
-            inode_db: LruCache::with_expiry_duration(TTL + Duration::from_secs(1)),
+            inode_db: LruCache::with_capacity(CAPACITY),
         })
     }
 
@@ -193,14 +197,14 @@ impl InodeCache {
         }
     }
 
-    pub fn get_data_dir_inode(&mut self, mount_point_inode: u64) -> Option<u64> {
+    pub fn get_data_dir_inode(&mut self, mount_point_ino: u64) -> Option<u64> {
         let data = self
             .inode_db
-            .get(&Inode::new_mp(mount_point_inode).mount_point_key())?;
+            .get(&Inode::new_mp(mount_point_ino).mount_point_key())?;
         let (_, dd_ino, _) = Self::extract_data(data);
 
         // Hit cache for both parts
-        let _ = self.get_inode_path(Inode::new(Some(mount_point_inode), Some(dd_ino)));
+        let _ = self.get_inode_path(Inode::new(Some(mount_point_ino), Some(dd_ino)));
 
         Some(dd_ino)
     }
