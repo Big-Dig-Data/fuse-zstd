@@ -1,6 +1,6 @@
 [package]
 name = "fuse-zstd"
-version = "0.5.2"
+version = "1.0.0"
 edition = "2021"
 authors = ["Stepan Henek <stepan@bigdigdata.com>"]
 license = "MIT"

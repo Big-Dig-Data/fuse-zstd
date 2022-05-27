@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-zstd"
-version = "0.5.2"
+version = "1.0.0"
 dependencies = [
  "assert_cmd",
  "clap",
