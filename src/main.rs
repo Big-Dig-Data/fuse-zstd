@@ -1,7 +1,9 @@
 mod cache;
+mod errors;
 mod file;
 
 use clap::{crate_authors, crate_name, crate_version, Arg, Command};
+use errors::convert_io_error;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request, FUSE_ROOT_ID,
@@ -19,6 +21,8 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 use xattr::FileExt as XattrFileExt;
+
+pub const TTL: Duration = Duration::from_secs(1); // dcache lifetime
 
 type Inode = u64;
 
@@ -41,14 +45,6 @@ impl FileAttrWrapper {
             .unwrap_or(0);
         Ok(())
     }
-}
-
-fn convert_io_error<E>(err: E) -> libc::c_int
-where
-    E: Into<io::Error>,
-{
-    let err: io::Error = err.into();
-    err.raw_os_error().unwrap_or(libc::EIO)
 }
 
 fn convert_ft(ft: fs::FileType) -> io::Result<fuser::FileType> {
@@ -139,6 +135,10 @@ impl ZstdFS {
         self.data_dir.clone()
     }
 
+    fn cache_path(&self) -> PathBuf {
+        self.data_dir().join(".fuse-zstd-inode_cache")
+    }
+
     #[inline]
     fn icache(&mut self) -> &mut cache::InodeCache {
         self.inode_cache.as_mut().unwrap()
@@ -217,6 +217,8 @@ impl ZstdFS {
         let path = self.get_path(parent)?;
         let entries = fs::read_dir(&path).map_err(convert_io_error)?;
         let name = name.to_string_lossy().to_string();
+        let cache_path = self.cache_path();
+
         for entry in entries {
             let entry = entry.map_err(convert_io_error)?;
 
@@ -226,6 +228,12 @@ impl ZstdFS {
             } else {
                 name.clone()
             };
+
+            // skip cache_dir from root
+            if parent == FUSE_ROOT_ID && cache_path == path.join(entry.file_name()) {
+                continue;
+            }
+
             if entry.file_name().to_string_lossy() == filename {
                 // Try to check the cache first
                 let mut faw = FileAttrWrapper::try_from(entry).map_err(convert_io_error)?;
@@ -307,6 +315,7 @@ impl ZstdFS {
         reply: &mut ReplyDirectory,
     ) -> Result<(), libc::c_int> {
         let file_path = self.get_path(ino)?;
+        let cache_path = self.cache_path();
         let metadata = fs::metadata(&file_path).map_err(convert_io_error)?;
         if !metadata.is_dir() {
             return Err(libc::ENOTDIR);
@@ -321,6 +330,11 @@ impl ZstdFS {
                 .map_err(convert_io_error)?;
 
             let orig_file_name = entry.file_name().to_string_lossy().to_string();
+
+            // skip cache_dir from root
+            if ino == FUSE_ROOT_ID && cache_path == file_path.join(&orig_file_name) {
+                continue;
+            }
 
             let file_name = match file_type {
                 FileType::RegularFile => {
@@ -627,7 +641,7 @@ impl ZstdFS {
         let path = parent_path.join(name.to_string_lossy().to_string() + ".zst");
         if let Some(ino_data) = xattr::get(&path, "user.ino").map_err(convert_io_error)? {
             let ino = u64::from_be_bytes(ino_data.try_into().unwrap());
-            self.icache().del_inode_path(ino);
+            self.icache().del_inode_path(ino)?;
             self.opened_files.unlink(ino);
         }
         fs::remove_file(path).map_err(convert_io_error)?;
@@ -639,9 +653,17 @@ impl ZstdFS {
         let path = parent_path.join(name.to_string_lossy().to_string());
         if let Some(ino_data) = xattr::get(&path, "user.ino").map_err(convert_io_error)? {
             let ino = u64::from_be_bytes(ino_data.try_into().unwrap());
-            self.icache().del_inode_path(ino);
+            self.icache().del_inode_path(ino)?;
             self.opened_files.unlink(ino);
         }
+
+        // Don't try to remove cache dir
+        let cache_dir = self.cache_path();
+        if cache_dir == parent_path.join(name) {
+            warn!("Cache dir '{}' can't be removed!", cache_dir.display());
+            return Err(libc::ENOENT);
+        }
+
         fs::remove_dir(path).map_err(convert_io_error)?;
         Ok(())
     }
@@ -679,7 +701,7 @@ impl ZstdFS {
         let to_path = to_parent_path.join(&newname);
 
         if let Some(orig_ino) = fs::metadata(&to_path).ok().map(|e| e.st_ino()) {
-            self.icache().del_inode_path(orig_ino);
+            self.icache().del_inode_path(orig_ino)?;
             self.opened_files.unlink(orig_ino);
         }
 
@@ -826,7 +848,22 @@ impl Filesystem for ZstdFS {
     ) -> Result<(), libc::c_int> {
         fs::create_dir_all(Path::new(&self.data_dir())).map_err(convert_io_error)?;
 
-        self.inode_cache = Some(cache::InodeCache::new()?);
+        let cache_root = self.cache_path();
+        if fs::remove_dir_all(&cache_root)
+            .map_err(convert_io_error)
+            .is_ok()
+        {
+            debug!("Clearing root cache directory {}", cache_root.display());
+        }
+        debug!("Creating cache root directory {}", cache_root.display());
+        fs::create_dir_all(&cache_root).map_err(convert_io_error)?;
+
+        let cache = cache::InodeCache::new(&cache_root)?;
+        let cache_path = cache.cache_data_dir().path().display();
+
+        debug!("Initializing inode cache at '{}'", cache_path);
+
+        self.inode_cache = Some(cache);
 
         Ok(())
     }
@@ -840,7 +877,7 @@ impl Filesystem for ZstdFS {
         match self.lookup_wrapper(parent, name) {
             Ok(attrs) => {
                 debug!("Lookup OK (inode=0x{:016x})", attrs.ino);
-                reply.entry(&cache::TTL, &attrs, 0);
+                reply.entry(&TTL, &attrs, 0);
             }
             Err(err) => {
                 debug!("Lookup Err (code={})", err);
@@ -854,7 +891,7 @@ impl Filesystem for ZstdFS {
         match self.getattr_wrapper(ino) {
             Ok(attrs) => {
                 debug!("getattr ok");
-                reply.attr(&cache::TTL, &attrs);
+                reply.attr(&TTL, &attrs);
             }
             Err(err) => {
                 debug!("getattr error({})", err);
@@ -890,7 +927,7 @@ impl Filesystem for ZstdFS {
         ) {
             Ok(attrs) => {
                 debug!("setattr ok");
-                reply.attr(&cache::TTL, &attrs);
+                reply.attr(&TTL, &attrs);
             }
             Err(err) => {
                 debug!("setattr error({})", err);
@@ -1006,7 +1043,7 @@ impl Filesystem for ZstdFS {
         match self.create_wrapper(parent, name, mode, umask, flags) {
             Ok((attrs, fh)) => {
                 debug!("created (inode=0x{:016x}, fh={})", attrs.ino, fh);
-                reply.created(&cache::TTL, &attrs, 0, fh, flags as u32);
+                reply.created(&TTL, &attrs, 0, fh, flags as u32);
             }
             Err(err) => {
                 debug!("create failed (err={})", err);
@@ -1058,7 +1095,7 @@ impl Filesystem for ZstdFS {
         match self.mkdir_wrapper(parent, name, mode, umask) {
             Ok(attrs) => {
                 debug!("mkdir passed (ino=0x{:016x})", attrs.ino);
-                reply.entry(&cache::TTL, &attrs, 0);
+                reply.entry(&TTL, &attrs, 0);
             }
             Err(err) => {
                 debug!("mkdir failed (err={})", err);
@@ -1167,6 +1204,13 @@ impl Filesystem for ZstdFS {
                 reply.error(err);
             }
         }
+    }
+
+    fn destroy(&mut self) {
+        let cache_dir = self.icache().cache_data_dir().path().to_owned();
+        debug!("Discarding inode cache at '{}'", cache_dir.display());
+        // Should drop the cache and delete tmp directory
+        self.inode_cache = None;
     }
 }
 

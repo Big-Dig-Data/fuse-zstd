@@ -1,22 +1,26 @@
-use lru_time_cache::LruCache;
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
+use sled;
+use tempfile::TempDir;
+
+use crate::errors::{convert_io_error, convert_sled_error};
 use crate::Inode;
 
-pub const TTL: Duration = Duration::from_secs(1); // dcache lifetime
-
-/// Max dcache capacity how many directories can be opened
-/// without loosing inode info
-pub const CAPACITY: usize = 10_000; // MAX inode cache capacity
-
 pub struct InodeCache {
-    inode_db: LruCache<Inode, Vec<u8>>,
+    inode_dir: TempDir,
+    inode_db: sled::Db,
 }
 
 impl InodeCache {
-    pub fn new() -> Result<Self, libc::c_int> {
+    pub fn new<P>(data_dir: P) -> Result<Self, libc::c_int>
+    where
+        P: AsRef<Path>,
+    {
+        let inode_dir = TempDir::new_in(data_dir).map_err(convert_io_error)?;
+        let inode_db = sled::open(&inode_dir).map_err(convert_sled_error)?;
         Ok(Self {
-            inode_db: LruCache::with_capacity(CAPACITY),
+            inode_dir,
+            inode_db,
         })
     }
 
@@ -33,7 +37,11 @@ impl InodeCache {
     }
 
     pub fn get_inode_path(&mut self, ino: Inode) -> Result<String, libc::c_int> {
-        let data = self.inode_db.get(&ino).map(|e| e.to_owned());
+        let data = self
+            .inode_db
+            .get(&ino.to_be_bytes())
+            .map(|e| e.to_owned())
+            .map_err(convert_sled_error)?;
         match data {
             Some(data) => {
                 let path = Self::extract_data(&data);
@@ -43,9 +51,12 @@ impl InodeCache {
         }
     }
 
-    pub fn del_inode_path(&mut self, ino: Inode) {
+    pub fn del_inode_path(&mut self, ino: Inode) -> Result<(), libc::c_int> {
         // remove inode - best effort
-        self.inode_db.remove(&ino);
+        self.inode_db
+            .remove(&ino.to_be_bytes())
+            .map_err(convert_sled_error)?;
+        Ok(())
     }
 
     fn make_path_str<P, N>(path: P, name: N) -> Result<String, libc::c_int>
@@ -78,6 +89,14 @@ impl InodeCache {
     {
         let path_data = Self::make_path_str(path, name)?.as_bytes().to_vec();
         let data = Self::make_data(ino, &path_data);
-        Ok(self.inode_db.insert(ino, data).is_some())
+        Ok(self
+            .inode_db
+            .insert(ino.to_be_bytes(), data)
+            .map_err(convert_sled_error)?
+            .is_some())
+    }
+
+    pub fn cache_data_dir(&self) -> &tempfile::TempDir {
+        &self.inode_dir
     }
 }

@@ -15,8 +15,8 @@ maintenance = { status = "actively-developed" }
 [features]
 default = []
 with_sentry = [
-	"sentry",
-	"sentry-log",
+    "sentry",
+    "sentry-log",
 ]
 
 [dependencies]
@@ -25,9 +25,9 @@ env_logger = "0.9"
 fuser = "0.11"
 libc = "0.2"
 log = "0.4"
-lru_time_cache = "0.11"
 sentry = { version = "0.26.0", features = ["log"], optional = true }
 sentry-log = { version = "0.26.0", optional = true }
+sled = "0.34"
 tempfile = "3"
 xattr = "0.2"
 zstd = "0.11"
