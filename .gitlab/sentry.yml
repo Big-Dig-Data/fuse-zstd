@@ -1,6 +1,6 @@
 release:sentry:
   stage: release
-  needs: []
+  needs: ["tests:run_check"]
   image:
     name: getsentry/sentry-cli
   variables:

@@ -6,7 +6,7 @@
 
 release:deb:
   stage: build
-  needs: []
+  needs: ["tests:run_check"]
   image: registry.gitlab.com/big-dig-data/fuse-zstd/fuse-zstd-test:latest
   script:
     - cargo deb
