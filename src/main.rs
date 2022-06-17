@@ -193,13 +193,12 @@ impl ZstdFS {
                 let source_path = refs.path;
                 let dir_path = source_path.parent().unwrap().to_path_buf();
 
-                let (source_file, _) = self.store_to_source_file(
+                self.store_to_source_file(
                     &file,
                     &dir_path,
                     source_path.file_name().unwrap(),
                     self.compression_level,
                 )?;
-                source_file.sync_all().map_err(convert_io_error)?;
 
                 // update needs_update because the file was synced
                 if !close {
@@ -273,13 +272,12 @@ impl ZstdFS {
                 {
                     let zname = format!("{}.zst", &name);
                     let source_file = fs::File::open(path.join(&name)).map_err(convert_io_error)?;
-                    let (file, _) = self.store_to_source_file(
+                    let (file, ino) = self.store_to_source_file(
                         &source_file,
                         &path,
                         &zname,
                         self.compression_level,
                     )?;
-                    file.sync_all().map_err(convert_io_error)?;
 
                     // File was copied now we can remove the original
                     let _ = fs::remove_file(path.join(&name));
@@ -289,8 +287,7 @@ impl ZstdFS {
                     )
                     .map_err(convert_io_error)?;
                     faw.update_realsize(&file)?;
-                    // Try to updat inode
-                    let ino = self.update_inode(&file).map_err(convert_io_error)?;
+
                     // Touch cache
                     self.icache().set_inode_path(ino, path, zname)?;
 
@@ -530,9 +527,8 @@ impl ZstdFS {
         let opened_file = tempfile::tempfile().map_err(convert_io_error)?;
 
         // Write new file to source directory
-        let (source_file, _) =
+        let (source_file, ino) =
             self.store_to_source_file(&opened_file, &parent_path, &name, self.compression_level)?;
-        source_file.sync_all().map_err(convert_io_error)?;
 
         // Obtain attrs of the new file
         let faw = FileAttrWrapper::try_from(source_file.metadata().map_err(convert_io_error)?)
@@ -543,14 +539,8 @@ impl ZstdFS {
         access_all(&mut attrs);
         // user.ino has to be se in store_to_source_file()
         // so we need to read it here
-        attrs.ino = u64::from_be_bytes(
-            source_file
-                .get_xattr("user.ino")
-                .unwrap()
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
+        attrs.ino = ino;
+
         // add inode to map
         self.icache()
             .set_inode_path(attrs.ino, &parent_path, &name)?;
@@ -768,7 +758,7 @@ where {
         dir_path: P1,
         name: P2,
         compression_level: u8,
-    ) -> Result<(fs::File, Option<fs::File>), libc::c_int>
+    ) -> Result<(fs::File, u64), libc::c_int>
     where
         P1: AsRef<Path>,
         P2: AsRef<Path>,
@@ -777,7 +767,6 @@ where {
         let tmp_file =
             tempfile::NamedTempFile::new_in(dir_path.as_ref()).map_err(convert_io_error)?;
         let path = dir_path.as_ref().join(name.as_ref());
-        let orig_file = fs::File::open(&path).ok();
 
         source.sync_all().map_err(convert_io_error)?;
 
@@ -802,41 +791,44 @@ where {
         encoder.finish().map_err(convert_io_error)?;
 
         // Try to update the ino of tmp file
-        match xattr::get(&path, "user.ino") {
+        let ino = match xattr::get(&path, "user.ino") {
             Ok(Some(ino_data)) => {
                 tmp_file
                     .as_file()
                     .set_xattr("user.ino", &ino_data)
                     .map_err(convert_io_error)?;
+
+                u64::from_be_bytes(ino_data.try_into().unwrap())
             }
             _ => {
                 // Error or None -> create new ino
+                let new_ino = self.update_inode_idx().map_err(convert_io_error)?;
                 tmp_file
                     .as_file()
-                    .set_xattr(
-                        "user.ino",
-                        &self
-                            .update_inode_idx()
-                            .map_err(convert_io_error)?
-                            .to_be_bytes(),
-                    )
+                    .set_xattr("user.ino", &new_ino.to_be_bytes())
                     .map_err(convert_io_error)?;
-            }
-        }
 
-        // Should atomically mode file to its destination
+                tmp_file.as_file().sync_all().map_err(convert_io_error)?;
+
+                new_ino
+            }
+        };
+
+        // Should atomically move file to its destination
         let file = tmp_file.persist(&path).map_err(convert_io_error)?;
+
+        // update filesize in xattrs
+        file.set_xattr("user.real_size", &real_size.to_be_bytes())
+            .map_err(convert_io_error)?;
+
+        // Sync it
         file.sync_all().map_err(convert_io_error)?;
         debug!(
             "After compression {}",
             file.metadata().map_err(convert_io_error)?.st_size()
         );
 
-        // update filesize in xattrs
-        file.set_xattr("user.real_size", &real_size.to_be_bytes())
-            .map_err(convert_io_error)?;
-
-        Ok((file, orig_file))
+        Ok((file, ino))
     }
 }
 

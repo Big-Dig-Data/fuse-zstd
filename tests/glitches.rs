@@ -204,45 +204,34 @@ fn flush(#[case] mounted_fs: utils::FuseZstdProcess) {
     fs::write(mp.join("file.txt"), b"ORIGINAL").unwrap();
     assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "ORIGINAL");
 
-    let original_ino = fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino();
-
     let mut file = fs::OpenOptions::new()
         .write(true)
         .open(mp.join("file.txt"))
         .unwrap();
 
     assert_eq!(
-        original_ino,
-        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
-        "Opening file doesn't touch compressed file",
+        utils::get_compressed_content(dd.join("file.txt.zst")),
+        "ORIGINAL",
+        "write should not trigger flush"
     );
-    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "ORIGINAL");
 
     file.write(b"OVERRIDE").unwrap();
 
     assert_eq!(
-        original_ino,
-        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
-        "Writing doesn't touch compressed file",
-    );
-    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "OVERRIDE");
-
-    assert_eq!(
-        original_ino,
-        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
-        "Write should not affect file in data dir",
+        utils::get_compressed_content(dd.join("file.txt.zst")),
+        "ORIGINAL",
+        "write should not trigger flush"
     );
 
     // closing cloned fd should trigger flush
     let cloned_file = file.try_clone().unwrap();
     mem::drop(cloned_file);
 
-    assert_ne!(
-        original_ino,
-        fs::metadata(dd.join("file.txt.zst")).unwrap().st_ino(),
-        "Flushing changes compressed file",
+    assert_eq!(
+        utils::get_compressed_content(dd.join("file.txt.zst")),
+        "OVERRIDE",
+        "read modified data"
     );
-    assert_eq!(fs::read_to_string(mp.join("file.txt")).unwrap(), "OVERRIDE");
 }
 
 #[rstest]
