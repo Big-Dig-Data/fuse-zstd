@@ -3,6 +3,7 @@ name = "fuse-zstd"
 version = "1.2.0"
 edition = "2021"
 authors = ["Stepan Henek <stepan@bigdigdata.com>"]
+description = "A simple FUSE filesystem where existing folder with files compressed by zstd is mapped to folder with uncompressed files."
 license = "MIT"
 readme = "README.md"
 keywords = ["fuse", "zstd"]
