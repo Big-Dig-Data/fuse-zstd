@@ -2,7 +2,7 @@ mod cache;
 mod errors;
 mod file;
 
-use clap::{crate_authors, crate_name, crate_version, Arg, Command};
+use clap::{crate_authors, crate_name, crate_version, Arg, ArgAction, Command};
 use errors::convert_io_error;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
@@ -568,7 +568,7 @@ impl ZstdFS {
         // Hit the cache
         let _ = self.get_path(ino);
 
-        let mut file_handler = self.opened_files.get_mut(fh).ok_or(libc::EBADF)?;
+        let file_handler = self.opened_files.get_mut(fh).ok_or(libc::EBADF)?;
 
         // File should be synced to source dir
         file_handler.needs_sync = true;
@@ -1217,7 +1217,7 @@ fn main() -> io::Result<()> {
                 .default_value("")
                 .help("Where FUSE fs shall be mounted")
                 .env("FUSE_ZSTD_MOUNT_POINT")
-                .takes_value(true),
+                .num_args(1),
         )
         .arg(
             Arg::new("data-dir")
@@ -1226,7 +1226,8 @@ fn main() -> io::Result<()> {
                 .default_value("/tmp/zstdfs/")
                 .help("Directory from which ZSTD files will be decompressed")
                 .env("FUSE_ZSTD_DATA_DIR")
-                .takes_value(true),
+                .action(ArgAction::Set)
+                .num_args(1),
         )
         .arg(
             Arg::new("compression-level")
@@ -1236,17 +1237,18 @@ fn main() -> io::Result<()> {
             .default_value("0")
             .help("Set compression level of zstd (0-19), 0 means use default value provided by library")
             .env("FUSE_ZSTD_COMPRESSION_LEVEL")
-            .takes_value(true)
+            .num_args(1)
         )
         .arg(
             Arg::new("v")
                 .short('v')
-                .multiple_occurrences(true)
+                .action(ArgAction::Count)
                 .help("Sets the level of verbosity"),
         )
         .arg(
             Arg::new("convert")
                 .long("convert")
+                .action(ArgAction::SetTrue)
                 .help("Will convert files uncompressed files from data dir"),
         );
 
@@ -1257,13 +1259,14 @@ fn main() -> io::Result<()> {
             .default_value("")
             .help("Sentry url where events will be sent")
             .env("FUSE_ZSTD_SENTRY_URL")
-            .takes_value(true),
+            .action(ArgAction::Set)
+            .num_args(1),
     );
 
     let matches = app.get_matches();
 
-    let verbosity: u64 = matches.occurrences_of("v");
-    let convert: bool = matches.is_present("convert");
+    let verbosity: u8 = matches.get_count("v");
+    let convert: bool = matches.get_flag("convert");
     let log_level = match verbosity {
         0 => LevelFilter::Error,
         1 => LevelFilter::Warn,
@@ -1272,8 +1275,15 @@ fn main() -> io::Result<()> {
         _ => LevelFilter::Trace,
     };
 
-    let data_dir: String = matches.value_of("data-dir").unwrap_or_default().to_string();
-    let compression_level = matches.value_of("compression-level").unwrap_or_default();
+    let data_dir: String = matches
+        .get_one("data-dir")
+        .map(String::to_owned)
+        .unwrap_or_default()
+        .to_string();
+    let compression_level = matches
+        .get_one("compression-level")
+        .map(String::to_owned)
+        .unwrap_or_default();
     let compression_level = compression_level.parse::<u8>().unwrap_or_else(|_| {
         warn!("Error parsing compression level. Using default.");
         0
@@ -1286,7 +1296,7 @@ fn main() -> io::Result<()> {
     };
 
     #[cfg(feature = "with_sentry")]
-    let _guard = if let Some(url) = matches.value_of("sentry-url") {
+    let _guard = if let Some(url) = matches.get_one("sentry-url").map(String::to_owned) {
         let mut log_builder = env_logger::builder();
         log_builder.filter_level(log_level);
         let logger = sentry_log::SentryLogger::with_dest(log_builder.build());
@@ -1308,7 +1318,8 @@ fn main() -> io::Result<()> {
     env_logger::builder().filter_level(log_level).init();
 
     let mountpoint: String = matches
-        .value_of("mount-point")
+        .get_one("mount-point")
+        .map(String::to_owned)
         .unwrap_or_default()
         .to_string();
     let options = vec![
