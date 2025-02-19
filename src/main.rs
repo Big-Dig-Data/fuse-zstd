@@ -878,7 +878,7 @@ impl Filesystem for ZstdFS {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         debug!("Getattr (inode=0x{:016x})", ino);
         match self.getattr_wrapper(ino) {
             Ok(attrs) => {
